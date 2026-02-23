@@ -574,8 +574,8 @@ def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
 
     restored = 0
     for slot, preset in enumerate(presets):
-        if not overwrite and preset.name.strip():
-            # Read existing to check if non-empty
+        if not overwrite:
+            # Read existing to check if slot is occupied
             response = conn.send_and_receive(build_read_preset(slot))
             if response:
                 parsed = parse_preset_response(response)
