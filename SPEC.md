@@ -745,45 +745,45 @@ Optionally reorder presets on the device.
 ## 14. Implementation Roadmap
 
 ### Phase 1: Protocol Foundation
-- [ ] Implement CRC-16 calculation with Mooer's lookup table
-- [ ] Implement message frame builder/parser (64-byte HID reports)
-- [ ] Implement USB HID connection via pyusb or hidapi (open, claim Interface 3, read, write)
-- [ ] Send Identify command (`0x10`) and parse response (firmware version + device name)
+- [x] Implement CRC-16 calculation with Mooer's lookup table
+- [x] Implement message frame builder/parser (64-byte HID reports)
+- [x] Implement USB HID connection via pyusb or hidapi (open, claim Interface 3, read, write)
+- [x] Send Identify command (`0x10`) and parse response (firmware version + device name)
 - [ ] Validate with Wireshark USB captures against real GE150 Pro Li device
 
 ### Phase 2: Preset Read/Write
-- [ ] Implement preset data model (serialize/deserialize 0x200-byte structure)
-- [ ] Read active preset from device
-- [ ] Read preset from specific slot
-- [ ] Write preset to slot (StorePatch command)
-- [ ] Select active preset (ActivePatch command)
-- [ ] Implement .mo file import/export
+- [x] Implement preset data model (serialize/deserialize 0x200-byte structure)
+- [x] Read active preset from device
+- [x] Read preset from specific slot
+- [x] Write preset to slot (StorePatch command)
+- [x] Select active preset (ActivePatch command)
+- [x] Implement .mo file import/export
 
 ### Phase 3: Real-Time Parameter Control
-- [ ] Send individual effect parameter changes (FX through REVERB commands)
-- [ ] Toggle effect modules on/off
-- [ ] Change effect order
-- [ ] Volume control
-- [ ] System settings read/write
+- [x] Send individual effect parameter changes (FX through REVERB commands)
+- [x] Toggle effect modules on/off
+- [x] Change effect order
+- [x] Volume control
+- [x] System settings read/write
 
 ### Phase 4: MCP Server
-- [ ] Set up FastMCP server with stdio transport
-- [ ] Expose connection tools (connect, disconnect, device_info)
-- [ ] Expose preset management tools
-- [ ] Expose real-time parameter tools
-- [ ] Expose resources for device state and catalogs
-- [ ] Add prompt templates
+- [x] Set up FastMCP server with stdio transport
+- [x] Expose connection tools (connect, disconnect, device_info)
+- [x] Expose preset management tools
+- [x] Expose real-time parameter tools
+- [x] Expose resources for device state and catalogs
+- [x] Add prompt templates
 
 ### Phase 5: Advanced Features
-- [ ] Full backup/restore (.mbf format)
-- [ ] IR/cabinet upload (.gnr + WAV conversion)
-- [ ] Batch preset operations
+- [x] Full backup/restore (.mbf format)
+- [x] IR/cabinet upload (.gnr + WAV conversion)
+- [x] Batch preset operations
 - [ ] Amp model upload (.gnr MNRS format)
 
 ### Phase 6: Polish
-- [ ] Error handling and USB reconnection logic
-- [ ] Input validation for all parameter ranges
-- [ ] Comprehensive test suite with mock USB device
+- [x] Error handling and USB reconnection logic
+- [x] Input validation for all parameter ranges
+- [x] Comprehensive test suite with mock USB device
 - [ ] Documentation and usage examples
 - [ ] Package for PyPI distribution
 
