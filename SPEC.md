@@ -10,7 +10,7 @@
 6. [Preset Data Structure](#preset-data-structure)
 7. [Effect Module Formats](#effect-module-formats)
 8. [File Formats](#file-formats)
-9. [MIDI Interface](#midi-interface)
+9. [Limitations & Clarifications](#limitations--clarifications)
 10. [MCP Server Design](#mcp-server-design)
 11. [MCP Tools](#mcp-tools)
 12. [MCP Resources](#mcp-resources)
@@ -22,7 +22,7 @@
 
 ## 1. Overview
 
-The Mooer GE150 Pro Li is a battery-powered guitar multi-effects pedal featuring 200 presets, 151 effects, 55 amp models, 26 cabinet simulations, 10 IR slots, and 4 footswitches. It connects to a host computer via USB-C (audio + MIDI) and supports Bluetooth 5.0.
+The Mooer GE150 Pro Li is a battery-powered guitar multi-effects pedal featuring 200 presets, 151+ effects, 55 amp models, 26 cabinet simulations, 10 IR slots (expandable to 20 with firmware v1.5.0+), and 4 footswitches. It connects to a host computer via USB-C for audio streaming and device control. It has **no standard MIDI ports** and **no Bluetooth** — all programmatic communication uses a proprietary binary protocol over **USB HID**.
 
 This specification documents:
 
@@ -42,7 +42,9 @@ The protocol details are derived from the [MooerManager](https://github.com/Thij
 | USB Product ID | `0x5703`                           |
 | Chipset        | STM32 microcontroller              |
 | Connection     | USB-C (USB 2.0 Full Speed)         |
-| USB Class      | Vendor-specific + Audio + MIDI     |
+| USB Class      | Composite: Audio + HID (no MIDI)   |
+| Manufacturer   | "MOOER"                            |
+| Max Packet     | 64 bytes (HID)                     |
 
 ### Linux udev Rule
 
@@ -54,57 +56,69 @@ SUBSYSTEM=="usb", ATTR{idVendor}=="0483", ATTR{idProduct}=="5703", GROUP="plugde
 
 ## 3. USB Transport Layer
 
-The pedal exposes multiple USB interfaces. Communication for settings/patch management uses vendor-specific bulk and interrupt endpoints:
+The pedal presents as a **USB composite device** with three interfaces:
 
-| Endpoint   | Direction | Transfer Type | Address |
-| ---------- | --------- | ------------- | ------- |
-| TX Bulk    | OUT       | Bulk          | `0x01`  |
-| TX Intr    | OUT       | Interrupt     | `0x02`  |
-| RX Intr    | IN        | Interrupt     | `0x81`  |
+| Interface | Class      | Endpoints          | Purpose                                   |
+| --------- | ---------- | ------------------ | ----------------------------------------- |
+| 1         | USB Audio  | `0x82` IN (Isoch)  | Audio from pedal (44.1kHz, 24-bit stereo) |
+| 2         | USB Audio  | `0x01` OUT (Isoch) | Audio to pedal (44.1kHz, 24-bit stereo)   |
+| **3**     | **USB HID**| `0x81` IN, `0x02` OUT (Interrupt) | **Control protocol — this is the communication channel** |
 
-- **Bulk transfers** (endpoint `0x01`) are used for large data like preset uploads, IR/cab uploads, and firmware
-- **Interrupt transfers** (endpoints `0x02` / `0x81`) are used for real-time parameter changes, status polling, and command/response exchanges
-- USB hotplug detection is supported via libusb
+All settings/patch communication uses **Interface 3 (HID)** with 64-byte interrupt transfers at a 10ms interval:
+
+| Endpoint   | Direction | Transfer Type | Address | Max Packet |
+| ---------- | --------- | ------------- | ------- | ---------- |
+| HID IN     | IN        | Interrupt     | `0x81`  | 64 bytes   |
+| HID OUT    | OUT       | Interrupt     | `0x02`  | 64 bytes   |
+
+> **Important**: The device does **not** enumerate as USB MIDI. It uses USB HID for all control communication. The isochronous audio endpoints (`0x01`, `0x82`) are for audio streaming only.
+
+Messages larger than ~58 bytes of payload are **chunked** across multiple 64-byte HID packets, which the receiver reassembles.
+
+USB hotplug detection is supported via libusb.
 
 ### Connection Sequence
 
 1. Open USB device by vendor/product ID (`0x0483:0x5703`)
-2. Claim the vendor-specific interface
+2. Detach any kernel HID driver and claim **Interface 3**
 3. Send an **Identify** command (`0x10`) to confirm the device and retrieve model/firmware info
-4. Begin issuing commands and listening for responses on the interrupt endpoints
+4. The Identify response contains a 5-byte firmware version and 11-byte device name
+5. Begin issuing commands on endpoint `0x02` OUT and reading responses on `0x81` IN
 
 ---
 
 ## 4. Message Framing Protocol
 
-All messages between host and pedal use a consistent binary frame:
+All messages between host and pedal use a consistent binary frame. Each frame is wrapped in a 64-byte USB HID report:
 
 ```
-+---------+---------+---------+------------------+----------+
-| Preamble|  Size   | Command |     Payload      | Checksum |
-| 2 bytes | 2 bytes | 1 byte  |  variable length |  2 bytes |
-+---------+---------+---------+------------------+----------+
++----------+---------+---------+---------+------------------+----------+---------+
+| HID Size | Preamble|  Size   | Command |     Payload      | Checksum | Padding |
+| 1 byte   | 2 bytes | 2 bytes | 1 byte  |  variable length |  2 bytes | to 64 B |
++----------+---------+---------+---------+------------------+----------+---------+
 ```
 
 | Field      | Size    | Encoding       | Description                                       |
 | ---------- | ------- | -------------- | ------------------------------------------------- |
+| HID Size   | 1 byte  | Unsigned       | Number of meaningful bytes in this HID report      |
 | Preamble   | 2 bytes | `0xAA 0x55`    | Magic bytes marking start of frame                |
-| Size       | 2 bytes | Little-endian  | Total payload size (command byte + payload data)   |
+| Size       | 2 bytes | Little-endian  | Payload length (command byte + payload data)       |
 | Command    | 1 byte  | Unsigned       | Command group identifier (see section 5)          |
 | Payload    | N bytes | Varies         | Command-specific data                             |
 | Checksum   | 2 bytes | Little-endian  | Inverted CRC-16 (`~crc`) over command + payload   |
+| Padding    | varies  | `0x00`         | Zero-padded to fill 64-byte HID report            |
 
 ### CRC-16 Calculation
 
-The checksum uses a CRC-16 algorithm with a 256-entry lookup table. The final value is bitwise-inverted (`~crc`). The CRC covers all bytes from the command byte through the end of the payload (does not include preamble or size fields).
+The checksum uses a CRC-16 algorithm with a 256-entry lookup table. The final value is bitwise-inverted (`~crc`). The CRC covers all bytes from the command byte through the end of the payload (does not include HID size, preamble, or size fields).
 
 ```python
 def crc16(data: bytes) -> int:
     """CRC-16 with Mooer's lookup table."""
     crc = 0x0000
     for byte in data:
-        index = (crc ^ byte) & 0xFF
-        crc = (crc >> 8) ^ CRC_TABLE[index]
+        crc = CRC_TABLE[(crc >> 8) ^ byte] ^ (crc << 8)
+        crc &= 0xFFFF
     return ~crc & 0xFFFF
 ```
 
@@ -114,12 +128,32 @@ The full 256-entry CRC lookup table is defined in the MooerManager source (`Mooe
 
 ```python
 def build_frame(command: int, payload: bytes = b"") -> bytes:
-    preamble = b"\xAA\x55"
     body = bytes([command]) + payload
     size = len(body).to_bytes(2, "little")
     checksum = crc16(body).to_bytes(2, "little")
-    return preamble + size + body + checksum
+    frame = b"\xAA\x55" + size + body + checksum
+    hid_size = len(frame).to_bytes(1, "big")
+    # Pad to 64 bytes for USB HID report
+    return hid_size + frame + b"\x00" * (63 - len(frame))
 ```
+
+### Concrete Example: Select Preset 3
+
+Captured from real device traffic (via [USBH_MIDI issue #74](https://github.com/YuuichiAkagawa/USBH_MIDI/issues/74)):
+
+```
+08 AA 55 02 00 A6 02 85 0D 00 E0 0B 00 00 ... (zero-padded to 64 bytes)
+```
+
+| Bytes   | Value       | Meaning                              |
+| ------- | ----------- | ------------------------------------ |
+| `08`    | 8           | HID report: 8 meaningful bytes follow|
+| `AA 55` | preamble    | Magic sync bytes                     |
+| `02 00` | 2 (LE)      | Payload length: 2 bytes              |
+| `A6`    | ActivePatch | Command group: select preset         |
+| `02`    | 2           | Preset index (0-based, so preset 3)  |
+| `85 0D` | CRC-16      | Inverted checksum of `[A6, 02]`      |
+| `00...` | padding     | Zero-padded to 64 bytes              |
 
 ---
 
@@ -188,24 +222,26 @@ Each preset occupies **0x200 bytes (512 bytes)** in the device's internal format
 | DELAY        | 0x81   | 17 bytes | Delay module                                    |
 | REVERB       | 0x92   | 13 bytes | Reverb module                                   |
 
-### .mo File Byte Offsets (Alternate Mapping)
+### .mo File Byte Offsets (Per-Parameter Mapping)
 
-For `.mo` preset files (0x800 bytes), the preset data begins at byte offset 0x200, yielding these absolute offsets:
+For `.mo` preset files (0x800 bytes), the preset data begins at byte offset 0x200. These absolute byte offsets are derived from the [mooerMoConvert](https://github.com/sidekickDan/mooerMoConvert) project and [sonnm's GE200-to-GE150 converter](https://gist.github.com/sonnm/a6378d2a4776edb5b1ede1dd3f1a29bb):
 
-| Field        | Absolute Offset | Size     |
-| ------------ | --------------- | -------- |
-| Preset Name  | 524 (0x20C)     | 16 bytes |
-| FX/COMP      | 541 (0x21D)     | 8 bytes  |
-| DS/OD        | 549 (0x225)     | 8 bytes  |
-| AMP          | 557 (0x22D)     | 8 bytes  |
-| CAB          | 565 (0x235)     | 8 bytes  |
-| NS GATE      | 573 (0x23D)     | 8 bytes  |
-| EQ           | 581 (0x245)     | 8 bytes  |
-| MOD          | 589 (0x24D)     | 8 bytes  |
-| DELAY        | 597 (0x255)     | 8 bytes  |
-| REVERB       | 605 (0x25D)     | 6 bytes  |
+| Field         | Offset | Parameters (byte offsets)                                          |
+| ------------- | ------ | ------------------------------------------------------------------ |
+| Preset Name   | 524    | 16 characters                                                      |
+| FX/COMP       | 541    | Type:541*, Switch:542, Attack:543, Threshold:544, Ratio:545, Level:546 |
+| DS/OD         | 549    | Type:549*, Switch:550, Volume:551, Tone:552, Gain:553              |
+| AMP           | 557    | Type:557*, Switch:558, Gain:559, Bass:560, Mid:561, Treble:562, Presence:563, Master:564 |
+| CAB           | 565    | Type:565*, Switch:566, Mic:567, Center:568, Distance:569           |
+| NS GATE       | 573    | Type:573*, Switch:574, Attack:575, Release:576, Threshold:577      |
+| EQ            | 581    | Type:581*, Switch:582, Bands:583–588 (formula: `16 + (byte - 12)`) |
+| MOD           | 589    | Type:589*, Switch:590, Rate:591, Level:592, Depth:593              |
+| DELAY         | 597    | Type:597*, Switch:598, Level:599, Feedback:600, Sub-D:604, Time:862–863 (16-bit LE) |
+| REVERB        | 605    | Type:605*, Switch:606, Pre-Delay:607, Level:608, Decay:609, Tone:610 |
 
-> **Note**: The byte-level mappings may differ slightly between GE-200 and GE150 Pro Li. Validation against real device captures is required.
+> \* **Type values** are stored as `actual_type + 1` in the file; subtract 1 when reading.
+
+> **Note**: These mappings may differ slightly between GE-200 and GE150 Pro Li firmware versions. Validation against real device captures is recommended.
 
 ---
 
@@ -379,39 +415,37 @@ Each effect module within a preset has a consistent structure: a 1-byte header f
 
 ---
 
-## 9. MIDI Interface
+## 9. Limitations & Clarifications
 
-The GE150 Pro Li also presents a standard USB MIDI interface. This is separate from the vendor-specific USB protocol above, but can be used for real-time performance control.
+### No Standard MIDI
 
-### Supported MIDI Messages
+The GE150 Pro Li does **not** have:
+- 5-pin DIN MIDI IN/OUT jacks
+- USB MIDI class compliance (it does not enumerate as a MIDI device)
+- Documented MIDI CC mappings or Program Change support
+- SysEx in the traditional MIDI sense
 
-| Message Type    | Usage                                      |
-| --------------- | ------------------------------------------ |
-| Program Change  | Switch active preset (0–199)               |
-| Control Change  | Adjust parameters (volume, reverb, etc.)   |
-| SysEx           | Arbitrary command passthrough               |
+All preset switching, parameter editing, and device control uses the **proprietary USB HID protocol** described in sections 3–5. The term "SysEx" appearing in some community code refers to the proprietary `0xAA 0x55` framed messages, not standard MIDI System Exclusive.
 
-### MIDI Monitoring (Linux)
+### No Bluetooth
 
-```bash
-# List MIDI ports
-aplaymidi -l
+Unlike some newer Mooer models (GE1000, GE200 Pro), the GE150 Pro Li does not have Bluetooth connectivity. All communication is USB-only.
 
-# Monitor incoming MIDI
-aseqdump -p 129:0
-```
+### External MIDI Control
 
-### MIDI in Context of MCP
+To use external MIDI controllers with the GE150 Pro Li, a hardware bridge device is required (e.g., the [DRAPsound REDSTONE](https://www.drapsound.com/redstone)) that translates standard MIDI Program Change messages into the Mooer proprietary USB protocol.
 
-The MIDI interface is useful for:
-- Real-time preset switching during performance
-- Expression pedal mapping
-- DAW integration and automation
+### Protocol Compatibility
 
-The vendor USB protocol (section 4) is preferred for:
-- Full preset read/write
-- System settings management
-- Bulk operations (backup/restore, IR uploads)
+The GE150 Pro Li shares the same protocol family as the GE150, GE150 Plus, GE150 Pro, GE150 Max, and GE200:
+
+- Same USB VID/PID (`0x0483:0x5703`)
+- Same STM32 microcontroller architecture
+- Cross-compatible presets (confirmed by Mooer for the GE150 family)
+- Same `.mo` file format with shared byte offsets
+- Same editor software architecture
+
+The GE150 Pro Li is essentially the GE150 Pro with an added lithium battery; the digital/USB architecture is identical. Some command payloads or parameter offsets may differ slightly due to firmware differences, but the framing format is the same.
 
 ---
 
@@ -423,7 +457,7 @@ The MCP server sits between an AI agent (Claude) and the Mooer pedal, translatin
 
 ```
 +--------+       JSON-RPC        +------------+       USB        +-----------+
-| Claude | <------ stdio ------> | MCP Server | <--- libusb ---> | GE150 Pro |
+| Claude | <------ stdio ------> | MCP Server | <-- USB HID ---> | GE150 Pro |
 | (Host) |   tools / resources   |  (Python)  |   0483:5703      |    Li     |
 +--------+                      +------------+                  +-----------+
 ```
@@ -434,8 +468,7 @@ The MCP server sits between an AI agent (Claude) and the Mooer pedal, translatin
 | ----------------- | ----------------------------- | ----------------------------------- |
 | Language          | Python 3.11+                  | Rich USB/MIDI library ecosystem     |
 | MCP SDK           | `mcp` (official Python SDK)   | First-class FastMCP support         |
-| USB Communication | `pyusb` + `libusb1`           | Cross-platform USB access           |
-| MIDI (optional)   | `python-rtmidi` or `mido`     | Standard MIDI for real-time control |
+| USB Communication | `pyusb` + `libusb1` or `hidapi` | Cross-platform USB HID access     |
 | Transport         | stdio (local) or SSE (remote) | stdio for Claude Desktop / CLI      |
 
 ### Project Structure
@@ -451,8 +484,7 @@ mooer-ge150-mcp/
       parser.py              # Response parsing
     transport/
       __init__.py
-      usb_connection.py      # pyusb device open/read/write
-      midi_connection.py     # Optional MIDI transport
+      usb_connection.py      # USB HID device open/read/write via pyusb or hidapi
     models/
       __init__.py
       preset.py              # Preset data model (serialize/deserialize)
@@ -714,10 +746,10 @@ Optionally reorder presets on the device.
 
 ### Phase 1: Protocol Foundation
 - [ ] Implement CRC-16 calculation with Mooer's lookup table
-- [ ] Implement message frame builder/parser
-- [ ] Implement USB connection via pyusb (open, claim, read, write)
-- [ ] Send Identify command and parse response
-- [ ] Verify communication with a real GE150 Pro Li device
+- [ ] Implement message frame builder/parser (64-byte HID reports)
+- [ ] Implement USB HID connection via pyusb or hidapi (open, claim Interface 3, read, write)
+- [ ] Send Identify command (`0x10`) and parse response (firmware version + device name)
+- [ ] Validate with Wireshark USB captures against real GE150 Pro Li device
 
 ### Phase 2: Preset Read/Write
 - [ ] Implement preset data model (serialize/deserialize 0x200-byte structure)
@@ -746,8 +778,7 @@ Optionally reorder presets on the device.
 - [ ] Full backup/restore (.mbf format)
 - [ ] IR/cabinet upload (.gnr + WAV conversion)
 - [ ] Batch preset operations
-- [ ] MIDI CC bridge for real-time performance integration
-- [ ] Bluetooth connection support (if protocol is documented)
+- [ ] Amp model upload (.gnr MNRS format)
 
 ### Phase 6: Polish
 - [ ] Error handling and USB reconnection logic
@@ -763,14 +794,20 @@ Optionally reorder presets on the device.
 | Resource | URL |
 | -------- | --- |
 | MooerManager (protocol RE) | https://github.com/ThijsWithaar/MooerManager |
+| mooerMoConvert (preset converter) | https://github.com/sidekickDan/mooerMoConvert |
+| sonnm's GE200-to-GE150 converter | https://gist.github.com/sonnm/a6378d2a4776edb5b1ede1dd3f1a29bb |
+| USBH_MIDI issue #74 (packet captures) | https://github.com/YuuichiAkagawa/USBH_MIDI/issues/74 |
+| DRAPsound REDSTONE (MIDI bridge) | https://www.drapsound.com/redstone |
 | Model Context Protocol | https://modelcontextprotocol.io |
 | MCP Python SDK | https://github.com/modelcontextprotocol/python-sdk |
 | pyusb | https://github.com/pyusb/pyusb |
-| python-rtmidi | https://github.com/SpotlightKid/python-rtmidi |
-| Mooer GE150 Pro Li Product Page | https://www.mooeraudio.com |
-| GE200-to-GE150 Preset Converter | Community tools (various GitHub repos) |
-| mcp-server-midi (reference) | https://github.com/sandst1/mcp-server-midi |
-| elektron-mcp (reference) | https://github.com/zerubeus/elektron-mcp |
+| hidapi (Python) | https://github.com/trezor/cython-hidapi |
+| Mooer GE150 Pro Product Page | https://www.mooeraudio.com/products/207.html |
+| Mooer Downloads (firmware/editor) | https://www.mooeraudio.com/Downloads_xq/6.html |
+| mcp-server-midi (MCP reference) | https://github.com/sandst1/mcp-server-midi |
+| elektron-mcp (MCP reference) | https://github.com/zerubeus/elektron-mcp |
+| VGuitarForums: GE150 MIDI discussion | https://www.vguitarforums.com/smf/index.php?topic=26432.0 |
+| LinuxMusicians: Mooer GE150 | https://linuxmusicians.com/viewtopic.php?t=21686 |
 
 ---
 
