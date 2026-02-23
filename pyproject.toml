@@ -1,0 +1,32 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mooer-ge150-mcp"
+version = "0.1.0"
+description = "MCP server for Mooer GE150 Pro Li guitar effects pedal"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "mcp>=1.0.0",
+    "hidapi>=0.14.0",
+]
+
+[project.optional-dependencies]
+pyusb = ["pyusb>=1.2.0"]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+mooer-ge150-mcp = "mooer_ge150_mcp.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mooer_ge150_mcp"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
