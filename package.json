@@ -1,0 +1,26 @@
+{
+  "name": "mooer-ge150-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Mooer GE150 Pro Li guitar effects pedal",
+  "license": "MIT",
+  "bin": {
+    "mooer-ge150-mcp": "bin/mooer-ge150-mcp.mjs"
+  },
+  "files": [
+    "bin/"
+  ],
+  "keywords": [
+    "mcp",
+    "mooer",
+    "ge150",
+    "guitar",
+    "effects",
+    "pedal",
+    "midi",
+    "usb"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fingerskier/Mooer_GE150_Pro_Li-IO.git"
+  }
+}
