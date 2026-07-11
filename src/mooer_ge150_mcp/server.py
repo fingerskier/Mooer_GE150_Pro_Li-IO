@@ -35,7 +35,7 @@ from .protocol.parser import (
     parse_system,
 )
 from .transport.usb_connection import USBConnection
-from .models.preset import Preset, MODULE_NAMES
+from .models.preset import Preset, MODULE_NAMES, PRESET_SIZE
 from .models.effects import MODULE_CLASSES
 from .models.system import SystemSettings
 from .models.file_formats import (
@@ -342,12 +342,16 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
     if parsed is None:
         return {"error": "Failed to parse source preset"}
 
-    preset = Preset.from_bytes(parsed.data)
-    frames = build_store_preset(to_slot, preset.to_bytes())
+    # Copy the raw bytes verbatim so unmodeled preset data is preserved
+    data = parsed.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
+    frames = build_store_preset(to_slot, data)
     conn.send_chunked_and_receive(frames)
-    _preset_cache[from_slot] = preset
-    _preset_cache[to_slot] = preset
-    return {"copied": True, "from": from_slot, "to": to_slot, "name": preset.name}
+    # Cache independent objects so partial updates to one slot can't
+    # bleed into the other
+    _preset_cache[from_slot] = Preset.from_bytes(data)
+    _preset_cache[to_slot] = Preset.from_bytes(data)
+    name = _preset_cache[to_slot].name
+    return {"copied": True, "from": from_slot, "to": to_slot, "name": name}
 
 
 @mcp.tool()
@@ -374,14 +378,15 @@ def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
     if parsed_a is None or parsed_b is None:
         return {"error": "Failed to parse preset data"}
 
-    preset_a = Preset.from_bytes(parsed_a.data)
-    preset_b = Preset.from_bytes(parsed_b.data)
+    # Swap the raw bytes verbatim so unmodeled preset data is preserved
+    data_a = parsed_a.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
+    data_b = parsed_b.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
 
     # Write A->B and B->A
-    conn.send_chunked_and_receive(build_store_preset(slot_b, preset_a.to_bytes()))
-    conn.send_chunked_and_receive(build_store_preset(slot_a, preset_b.to_bytes()))
-    _preset_cache[slot_a] = preset_b
-    _preset_cache[slot_b] = preset_a
+    conn.send_chunked_and_receive(build_store_preset(slot_b, data_a))
+    conn.send_chunked_and_receive(build_store_preset(slot_a, data_b))
+    _preset_cache[slot_a] = Preset.from_bytes(data_b)
+    _preset_cache[slot_b] = Preset.from_bytes(data_a)
 
     return {"swapped": True, "slot_a": slot_a, "slot_b": slot_b}
 

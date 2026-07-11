@@ -33,10 +33,10 @@ pytest tests/test_patch_rw.py -v   # patch R/W suite only
 | CRC | `test_crc.py` | Checksum against known vectors |
 | Framing | `test_framing.py` | 64-byte report structure, preamble, checksum, chunk splitting |
 | Command builders | `test_commands.py` | Slot bounds, store-preset payload layout |
-| Preset model | `test_preset.py`, `test_patch_rw.py` | 512-byte serialize/deserialize round-trip, 16-bit delay time, param byte offsets |
+| Preset model | `test_preset.py`, `test_patch_rw.py` | 512-byte serialize/deserialize round-trip, opaque tail-byte (0x9F–0x1FF) preservation, 16-bit delay time, param byte offsets |
 | File formats | `test_file_formats.py` | `.mo` / `.mbf` export–import round-trips, `.gnr` header |
 | Transport | `test_patch_rw.py` | Chunked TX **and** chunked-RX reassembly over a fake HID device |
-| Server tools | `test_patch_rw.py`, `test_restore_overwrite.py` | `get_preset` / `set_preset` / `copy` / `swap` / `export` / `import` / `backup_all` / `restore_backup`, cache coherence, overwrite guard |
+| Server tools | `test_patch_rw.py`, `test_restore_overwrite.py` | `get_preset` / `set_preset` / `copy` / `swap` / `export` / `import` / `backup_all` / `restore_backup`, byte-exact copy/swap (opaque data intact), cache coherence without aliasing, overwrite guard |
 
 The patch R/W suite drives the **real** protocol and transport code
 against `tests/fake_device.py` — a fake pedal that speaks the wire

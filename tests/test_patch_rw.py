@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import patch
 
-from mooer_ge150_mcp.models.preset import Preset, PRESET_SIZE
+from mooer_ge150_mcp.models.preset import Preset, PRESET_SIZE, OFF_TAIL
 from mooer_ge150_mcp.models.effects import (
     AmpModule,
     DistortionModule,
@@ -65,6 +65,21 @@ def test_preset_bytes_roundtrip():
 
 def test_preset_serialized_size():
     assert len(_make_rich_preset().to_bytes()) == PRESET_SIZE
+
+
+def _with_opaque_tail(preset: Preset) -> bytes:
+    """Serialize a preset, then fill the unmodeled tail with a pattern."""
+    raw = bytearray(preset.to_bytes())
+    raw[OFF_TAIL:PRESET_SIZE] = bytes(
+        (i * 7 + 13) & 0xFF for i in range(PRESET_SIZE - OFF_TAIL)
+    )
+    return bytes(raw)
+
+
+def test_preset_preserves_opaque_tail_bytes():
+    """Unmodeled bytes (0x9F-0x1FF) must survive from_bytes → to_bytes."""
+    raw = _with_opaque_tail(_make_rich_preset())
+    assert Preset.from_bytes(raw).to_bytes() == raw
 
 
 def test_delay_16bit_time_roundtrip():
@@ -179,6 +194,52 @@ def test_server_set_preset_merges_over_existing():
 
     assert read_back["name"] == "Renamed"
     assert read_back["effects"]["amp"]["amp_gain"] == 200  # preserved
+
+
+def test_server_copy_and_swap_preserve_opaque_bytes():
+    """copy/swap must be byte-for-byte safe, including unmodeled data."""
+    server, conn, pedal = _server_with_pedal()
+    raw_a = _with_opaque_tail(_make_rich_preset("Opaque A"))
+    raw_b = _with_opaque_tail(_make_rich_preset("Opaque B"))
+    pedal.slots[0] = raw_a
+    pedal.slots[1] = raw_b
+
+    with patch.object(server, "_get_connection", return_value=conn):
+        server.copy_preset(0, 10)
+        assert pedal.slots[10] == raw_a
+
+        server.swap_presets(0, 1)
+        assert pedal.slots[0] == raw_b
+        assert pedal.slots[1] == raw_a
+
+
+def test_server_set_preset_merge_preserves_opaque_bytes():
+    """A partial set_preset must not zero the unmodeled tail bytes."""
+    server, conn, pedal = _server_with_pedal()
+    raw = _with_opaque_tail(_make_rich_preset("Opaque"))
+    pedal.slots[3] = raw
+
+    with patch.object(server, "_get_connection", return_value=conn):
+        server.set_preset(3, name="Renamed")
+
+    assert pedal.slots[3][OFF_TAIL:] == raw[OFF_TAIL:]
+    assert Preset.from_bytes(pedal.slots[3]).name == "Renamed"
+
+
+def test_server_copy_cache_entries_not_aliased():
+    """Partial updates to a copied slot must not bleed into the source."""
+    server, conn, pedal = _server_with_pedal()
+    pedal.slots[0] = _make_rich_preset("Tone A").to_bytes()
+
+    with patch.object(server, "_get_connection", return_value=conn):
+        server.copy_preset(0, 10)
+        assert server._preset_cache[0] is not server._preset_cache[10]
+
+        server.set_preset(10, name="Diverged")
+
+    assert server._preset_cache[0].name == "Tone A"
+    assert Preset.from_bytes(pedal.slots[0]).name == "Tone A"
+    assert Preset.from_bytes(pedal.slots[10]).name == "Diverged"
 
 
 def test_server_copy_and_swap_presets():

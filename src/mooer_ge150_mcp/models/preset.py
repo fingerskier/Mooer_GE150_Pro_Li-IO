@@ -40,6 +40,8 @@ OFF_EQ = 0x5B             # 23 bytes
 OFF_MOD = 0x72            # 15 bytes
 OFF_DELAY = 0x81          # 17 bytes
 OFF_REVERB = 0x92         # 13 bytes
+OFF_TAIL = 0x9F           # opaque bytes after the last modeled module
+TAIL_SIZE = PRESET_SIZE - OFF_TAIL  # 353 bytes
 
 MODULE_NAMES = ["fx", "od", "amp", "cab", "ns", "eq", "mod", "delay", "reverb"]
 
@@ -61,6 +63,9 @@ class Preset:
     mod: ModulationModule = field(default_factory=ModulationModule)
     delay: DelayModule = field(default_factory=DelayModule)
     reverb: ReverbModule = field(default_factory=ReverbModule)
+    # Bytes 0x9F-0x1FF are not yet reverse-engineered; carry them through
+    # serialization untouched so device data is never silently zeroed.
+    tail: bytes = field(default_factory=lambda: b"\x00" * TAIL_SIZE)
 
     def to_bytes(self) -> bytes:
         """Serialize the preset to a 0x200-byte structure."""
@@ -90,6 +95,9 @@ class Preset:
         buf[OFF_DELAY : OFF_DELAY + DelayModule.SIZE] = self.delay.to_bytes()
         buf[OFF_REVERB : OFF_REVERB + ReverbModule.SIZE] = self.reverb.to_bytes()
 
+        # Opaque tail bytes, preserved verbatim
+        buf[OFF_TAIL:PRESET_SIZE] = self.tail[:TAIL_SIZE].ljust(TAIL_SIZE, b"\x00")
+
         return bytes(buf)
 
     @classmethod
@@ -115,6 +123,7 @@ class Preset:
             mod=ModulationModule.from_bytes(data[OFF_MOD : OFF_MOD + ModulationModule.SIZE]),
             delay=DelayModule.from_bytes(data[OFF_DELAY : OFF_DELAY + DelayModule.SIZE]),
             reverb=ReverbModule.from_bytes(data[OFF_REVERB : OFF_REVERB + ReverbModule.SIZE]),
+            tail=bytes(data[OFF_TAIL:PRESET_SIZE]),
         )
 
     def to_dict(self) -> dict:
