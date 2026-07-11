@@ -6,7 +6,7 @@ values are unsigned 8-bit integers (0-255) unless noted otherwise.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from typing import ClassVar
 
 
@@ -15,6 +15,9 @@ class EffectModule:
     """Base class for effect modules."""
 
     SIZE: ClassVar[int] = 0
+    # Byte width of each parameter within the serialized module.
+    # Fields not listed occupy 1 byte.
+    FIELD_WIDTHS: ClassVar[dict[str, int]] = {}
     header: int = 0
     enabled: int = 0
     type: int = 0
@@ -26,8 +29,22 @@ class EffectModule:
     def from_bytes(cls, data: bytes):
         raise NotImplementedError
 
+    @classmethod
+    def param_offsets(cls) -> dict[str, int]:
+        """Map each parameter name to its byte offset within the module."""
+        offsets: dict[str, int] = {}
+        offset = 0
+        for f in fields(cls):
+            if f.name == "reserved":
+                continue
+            offsets[f.name] = offset
+            offset += cls.FIELD_WIDTHS.get(f.name, 1)
+        return offsets
+
     def to_dict(self) -> dict:
         d = asdict(self)
+        # Raw bytes are not JSON-serializable and carry no user-facing info
+        d.pop("reserved", None)
         d["enabled"] = bool(d["enabled"])
         return d
 
@@ -179,6 +196,7 @@ class EQModule(EffectModule):
     """Equalizer module (23 bytes)."""
 
     SIZE: ClassVar[int] = 23
+    FIELD_WIDTHS: ClassVar[dict[str, int]] = {"bands": 6, "bands_extra": 6}
     bands: list[int] = field(default_factory=lambda: [0] * 6)
     bands_extra: list[int] = field(default_factory=lambda: [0] * 6)
     reserved: bytes = field(default_factory=lambda: b"\x00" * 8)
@@ -239,6 +257,7 @@ class DelayModule(EffectModule):
     """
 
     SIZE: ClassVar[int] = 17
+    FIELD_WIDTHS: ClassVar[dict[str, int]] = {"time_ms": 2}
     level: int = 0
     feedback: int = 0
     time_ms: int = 0  # 16-bit, stored as bytes 5-6

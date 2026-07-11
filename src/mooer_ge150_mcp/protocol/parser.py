@@ -139,7 +139,11 @@ def parse_response(frame: Frame):
         Command.VOLUME: parse_volume,
         Command.SYSTEM: parse_system,
     }
-    parser = parsers.get(Command(frame.command))
+    try:
+        command = Command(frame.command)
+    except ValueError:
+        return frame
+    parser = parsers.get(command)
     if parser:
         result = parser(frame)
         if result is not None:

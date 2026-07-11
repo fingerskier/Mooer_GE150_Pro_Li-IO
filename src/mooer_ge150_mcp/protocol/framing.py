@@ -22,7 +22,8 @@ from ..utils.crc import crc16
 
 PREAMBLE = b"\xAA\x55"
 HID_REPORT_SIZE = 64
-MAX_PAYLOAD_PER_FRAME = 58  # 64 - 1(hid_size) - 2(preamble) - 2(size) - 1(cmd)
+# 64 - 1(hid_size) - 2(preamble) - 2(size) - 1(cmd) - 2(checksum)
+MAX_PAYLOAD_PER_FRAME = 56
 
 
 @dataclass
@@ -48,7 +49,16 @@ def build_frame(command: int, payload: bytes = b"") -> bytes:
 
     Returns:
         A 64-byte ``bytes`` object ready to send via USB HID interrupt transfer.
+
+    Raises:
+        ValueError: If the payload does not fit in a single frame
+            (use :func:`build_chunked_frames` instead).
     """
+    if len(payload) > MAX_PAYLOAD_PER_FRAME:
+        raise ValueError(
+            f"Payload of {len(payload)} bytes exceeds single-frame limit of "
+            f"{MAX_PAYLOAD_PER_FRAME}; use build_chunked_frames()"
+        )
     body = bytes([command]) + payload
     size = len(body).to_bytes(2, "little")
     checksum = crc16(body).to_bytes(2, "little")
@@ -90,6 +100,62 @@ def build_chunked_frames(command: int, payload: bytes) -> list[bytes]:
     return frames
 
 
+def parse_message(assembled: bytes) -> Frame | None:
+    """Parse a fully assembled protocol message (preamble onward).
+
+    Args:
+        assembled: ``preamble + size + command + payload + checksum`` with
+            any HID report framing (length prefixes, padding) already removed.
+
+    Returns:
+        A ``Frame`` if the preamble, length, and checksum are valid,
+        else ``None``.
+    """
+    if len(assembled) < 7:
+        return None
+
+    if assembled[0:2] != PREAMBLE:
+        return None
+
+    body_size = int.from_bytes(assembled[2:4], "little")
+    if body_size < 1:
+        return None
+
+    # Message must contain the full body plus 2 checksum bytes
+    if len(assembled) < 4 + body_size + 2:
+        return None
+
+    command = assembled[4]
+    payload = assembled[5 : 4 + body_size]
+
+    body = assembled[4 : 4 + body_size]
+    expected_checksum = int.from_bytes(
+        assembled[4 + body_size : 4 + body_size + 2], "little"
+    )
+    if crc16(body) != expected_checksum:
+        return None
+
+    return Frame(command=command, payload=payload)
+
+
+def message_total_size(header: bytes) -> int | None:
+    """Return the total assembled message size implied by a message header.
+
+    Args:
+        header: At least the first 4 assembled bytes (preamble + size).
+
+    Returns:
+        Total message length in bytes (preamble + size + body + checksum),
+        or ``None`` if the header is invalid.
+    """
+    if len(header) < 4 or header[0:2] != PREAMBLE:
+        return None
+    body_size = int.from_bytes(header[2:4], "little")
+    if body_size < 1:
+        return None
+    return 4 + body_size + 2
+
+
 def parse_frame(data: bytes) -> Frame | None:
     """Parse a 64-byte HID report into a Frame.
 
@@ -97,8 +163,9 @@ def parse_frame(data: bytes) -> Frame | None:
         data: A 64-byte USB HID report.
 
     Returns:
-        A ``Frame`` if the report contains a valid protocol message,
-        or ``None`` if the preamble is missing or the checksum fails.
+        A ``Frame`` if the report contains a complete valid protocol
+        message, or ``None`` if the preamble is missing, the message is
+        incomplete, or the checksum fails.
     """
     if len(data) < 8:
         return None
@@ -107,28 +174,7 @@ def parse_frame(data: bytes) -> Frame | None:
     if hid_size < 7:
         return None
 
-    # Check preamble
-    if data[1:3] != PREAMBLE:
-        return None
-
-    # Parse size (little-endian)
-    body_size = int.from_bytes(data[3:5], "little")
-    if body_size < 1:
-        return None
-
-    command = data[5]
-    payload = data[6 : 5 + body_size]
-
-    # Verify checksum
-    body = data[5 : 5 + body_size]
-    expected_checksum = int.from_bytes(
-        data[5 + body_size : 5 + body_size + 2], "little"
-    )
-    actual_checksum = crc16(body)
-    if actual_checksum != expected_checksum:
-        return None
-
-    return Frame(command=command, payload=payload)
+    return parse_message(data[1 : 1 + hid_size])
 
 
 def parse_chunked_frames(reports: list[bytes]) -> Frame | None:
@@ -148,27 +194,4 @@ def parse_chunked_frames(reports: list[bytes]) -> Frame | None:
         chunk_size = report[0]
         assembled += report[1 : 1 + chunk_size]
 
-    if len(assembled) < 7:
-        return None
-
-    # Verify preamble
-    if assembled[0:2] != PREAMBLE:
-        return None
-
-    body_size = int.from_bytes(assembled[2:4], "little")
-    if body_size < 1:
-        return None
-
-    command = assembled[4]
-    payload = assembled[5 : 4 + body_size]
-
-    # Verify checksum
-    body = assembled[4 : 4 + body_size]
-    expected_checksum = int.from_bytes(
-        assembled[4 + body_size : 4 + body_size + 2], "little"
-    )
-    actual_checksum = crc16(body)
-    if actual_checksum != expected_checksum:
-        return None
-
-    return Frame(command=command, payload=payload)
+    return parse_message(assembled)
