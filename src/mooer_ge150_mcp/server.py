@@ -33,11 +33,9 @@ from .protocol.parser import (
     parse_active_patch,
     parse_volume,
     parse_system,
-    parse_response,
 )
-from .protocol.framing import parse_frame
 from .transport.usb_connection import USBConnection
-from .models.preset import Preset
+from .models.preset import Preset, MODULE_NAMES, PRESET_SIZE
 from .models.effects import MODULE_CLASSES
 from .models.system import SystemSettings
 from .models.file_formats import (
@@ -46,6 +44,7 @@ from .models.file_formats import (
     export_mbf,
     import_mbf,
     parse_gnr_header,
+    MBF_PRESET_COUNT,
 )
 
 logger = logging.getLogger(__name__)
@@ -132,7 +131,11 @@ def connect() -> dict[str, Any]:
         }
 
     _connection = USBConnection()
-    info = _connection.open()
+    try:
+        info = _connection.open()
+    except Exception:
+        _connection = None
+        raise
 
     # Send Identify command
     identify_frame = build_identify()
@@ -339,9 +342,16 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
     if parsed is None:
         return {"error": "Failed to parse source preset"}
 
-    frames = build_store_preset(to_slot, parsed.data[:0x200].ljust(0x200, b"\x00"))
+    # Copy the raw bytes verbatim so unmodeled preset data is preserved
+    data = parsed.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
+    frames = build_store_preset(to_slot, data)
     conn.send_chunked_and_receive(frames)
-    return {"copied": True, "from": from_slot, "to": to_slot}
+    # Cache independent objects so partial updates to one slot can't
+    # bleed into the other
+    _preset_cache[from_slot] = Preset.from_bytes(data)
+    _preset_cache[to_slot] = Preset.from_bytes(data)
+    name = _preset_cache[to_slot].name
+    return {"copied": True, "from": from_slot, "to": to_slot, "name": name}
 
 
 @mcp.tool()
@@ -368,12 +378,15 @@ def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
     if parsed_a is None or parsed_b is None:
         return {"error": "Failed to parse preset data"}
 
-    data_a = parsed_a.data[:0x200].ljust(0x200, b"\x00")
-    data_b = parsed_b.data[:0x200].ljust(0x200, b"\x00")
+    # Swap the raw bytes verbatim so unmodeled preset data is preserved
+    data_a = parsed_a.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
+    data_b = parsed_b.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
 
     # Write A->B and B->A
     conn.send_chunked_and_receive(build_store_preset(slot_b, data_a))
     conn.send_chunked_and_receive(build_store_preset(slot_a, data_b))
+    _preset_cache[slot_a] = Preset.from_bytes(data_b)
+    _preset_cache[slot_b] = Preset.from_bytes(data_a)
 
     return {"swapped": True, "slot_a": slot_a, "slot_b": slot_b}
 
@@ -396,19 +409,25 @@ def set_effect_param(
     if module not in MODULE_CLASSES:
         return {"error": f"Unknown module '{module}'. Valid: {list(MODULE_CLASSES)}"}
 
-    # Map param name to byte index within the module
+    # Map param name to its byte offset within the module
     cls = MODULE_CLASSES[module]
-    dummy = cls()
-    fields = [f.name for f in dummy.__dataclass_fields__.values()
-              if f.name not in ("reserved", "SIZE")]
-    if param not in fields:
-        return {"error": f"Unknown param '{param}' for {module}. Valid: {fields}"}
+    offsets = cls.param_offsets()
+    if param not in offsets:
+        return {"error": f"Unknown param '{param}' for {module}. Valid: {list(offsets)}"}
 
-    param_index = fields.index(param)
+    width = cls.FIELD_WIDTHS.get(param, 1)
+    if width > 2:
+        return {"error": f"Param '{param}' is a multi-byte array; set it via set_preset"}
 
+    max_value = 0xFFFF if width == 2 else 0xFF
+    if not 0 <= value <= max_value:
+        return {"error": f"Value for '{param}' must be 0-{max_value}, got {value}"}
+
+    offset = offsets[param]
     conn = _get_connection()
-    frame = build_effect_param(module, param_index, value & 0xFF)
-    conn.write(frame)
+    conn.write(build_effect_param(module, offset, value & 0xFF))
+    if width == 2:
+        conn.write(build_effect_param(module, offset + 1, (value >> 8) & 0xFF))
 
     return {"module": module, "param": param, "value": value}
 
@@ -445,9 +464,7 @@ def set_effect_order(order: list[str]) -> dict[str, Any]:
             return {"error": f"Unknown module '{m}' in order. Valid: {sorted(valid)}"}
 
     # Build order byte array (maps position -> module index)
-    module_index_map = {name: i for i, name in enumerate(
-        ["fx", "od", "amp", "cab", "ns", "eq", "mod", "delay", "reverb"]
-    )}
+    module_index_map = {name: i for i, name in enumerate(MODULE_NAMES)}
     order_bytes = bytes([module_index_map.get(m, 0) for m in order])
     # Pad to 10 bytes
     order_bytes = order_bytes.ljust(10, b"\x00")
@@ -541,21 +558,26 @@ def backup_all(output_path: str) -> dict[str, Any]:
     """
     conn = _get_connection()
     presets: list[Preset] = []
+    failed_slots: list[int] = []
 
-    for slot in range(199):
+    for slot in range(MBF_PRESET_COUNT):
         response = conn.send_and_receive(build_read_preset(slot))
-        if response:
-            parsed = parse_preset_response(response)
-            if parsed:
-                preset = Preset.from_bytes(parsed.data)
-                presets.append(preset)
-            else:
-                presets.append(Preset())
+        parsed = parse_preset_response(response) if response else None
+        if parsed:
+            presets.append(Preset.from_bytes(parsed.data))
         else:
+            failed_slots.append(slot)
             presets.append(Preset())
 
     path = export_mbf(presets, output_path)
-    return {"path": str(path), "preset_count": len(presets)}
+    result: dict[str, Any] = {"path": str(path), "preset_count": len(presets)}
+    if failed_slots:
+        result["failed_slots"] = failed_slots
+        result["warning"] = (
+            f"{len(failed_slots)} slot(s) could not be read and were "
+            "written as empty presets"
+        )
+    return result
 
 
 @mcp.tool()
@@ -586,6 +608,7 @@ def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
 
         frames = build_store_preset(slot, preset.to_bytes())
         conn.send_chunked_and_receive(frames)
+        _preset_cache[slot] = preset
         restored += 1
 
     return {"restored": True, "preset_count": restored}
@@ -633,6 +656,7 @@ def import_preset(input_path: str, slot: int) -> dict[str, Any]:
     conn = _get_connection()
     frames = build_store_preset(slot, preset.to_bytes())
     conn.send_chunked_and_receive(frames)
+    _preset_cache[slot] = preset
 
     return {"imported": True, "slot": slot, "name": preset.name}
 

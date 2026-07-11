@@ -11,7 +11,12 @@ import logging
 import time
 from dataclasses import dataclass, field
 
-from ..protocol.framing import Frame, parse_frame, HID_REPORT_SIZE
+from ..protocol.framing import (
+    Frame,
+    parse_message,
+    message_total_size,
+    HID_REPORT_SIZE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -223,6 +228,45 @@ class USBConnection:
             logger.debug("Read error: %s", e)
             return None
 
+    def read_message(self, timeout_ms: int = READ_TIMEOUT_MS) -> Frame | None:
+        """Read one complete protocol message, reassembling chunked reports.
+
+        Responses larger than one 64-byte HID report (e.g. the 512-byte
+        preset data) arrive split across multiple reports. Each report
+        carries a 1-byte length prefix; the first report's message header
+        (preamble + size) tells us how many total bytes to expect.
+
+        Args:
+            timeout_ms: Timeout for each individual report read.
+
+        Returns:
+            The parsed Frame, or None on timeout, bad preamble, or
+            checksum failure.
+        """
+        report = self.read(timeout_ms)
+        if report is None:
+            return None
+
+        chunk_size = report[0]
+        assembled = bytes(report[1 : 1 + chunk_size])
+
+        total = message_total_size(assembled)
+        if total is None:
+            return None
+
+        while len(assembled) < total:
+            report = self.read(timeout_ms)
+            if report is None:
+                logger.debug(
+                    "Timed out mid-message: %d of %d bytes assembled",
+                    len(assembled), total,
+                )
+                return None
+            chunk_size = report[0]
+            assembled += bytes(report[1 : 1 + chunk_size])
+
+        return parse_message(assembled)
+
     def send_and_receive(
         self,
         data: bytes,
@@ -238,10 +282,7 @@ class USBConnection:
             Parsed Frame, or None if no valid response was received.
         """
         self.write(data)
-        response = self.read(timeout_ms)
-        if response is None:
-            return None
-        return parse_frame(response)
+        return self.read_message(timeout_ms)
 
     def send_chunked_and_receive(
         self,
@@ -264,7 +305,4 @@ class USBConnection:
             if i < len(frames) - 1:
                 time.sleep(inter_frame_delay)
 
-        response = self.read(timeout_ms)
-        if response is None:
-            return None
-        return parse_frame(response)
+        return self.read_message(timeout_ms)
