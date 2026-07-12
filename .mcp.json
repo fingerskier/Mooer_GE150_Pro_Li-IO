@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mooer-ge150": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/bin/mooer-ge150-mcp.mjs"]
+    }
+  }
+}
