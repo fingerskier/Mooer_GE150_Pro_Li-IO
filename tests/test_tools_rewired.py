@@ -38,7 +38,7 @@ def test_server_imports_and_registers_its_tools():
     import mooer_ge150_mcp.server as real_server
 
     tools = asyncio.run(real_server.mcp.list_tools())
-    assert len(tools) == 35
+    assert len(tools) == 36
     assert "list_ir_slots" in {t.name for t in tools}
 
 

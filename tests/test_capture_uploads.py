@@ -76,3 +76,50 @@ class TestUserModelListSplit:
         assert [(c["display"], c["name"]) for c in used_cabs] == [
             (27, "C-2X12 FENDER DX"), (28, "34 CT-BogOS412"),
         ]
+
+
+class TestGlobalEQ:
+    """0xD1 decoded from log/test5.pcapng -- eight annotated edits."""
+
+    def test_verbatim_final_block_decodes(self):
+        from mooer_ge150_mcp.protocol.commands import decode_global_eq
+
+        payload = b"".join(
+            v.to_bytes(2, "little")
+            for v in [1, 6115, 34, 9217, 46, 9952, 28, 409, 10585]
+        )
+        eq = decode_global_eq(payload)
+        assert eq.enabled is True
+        assert (eq.low_freq, eq.low_gain_db) == (6115, 1.0)
+        assert (eq.mid_freq, eq.mid_gain_db) == (9217, 7.0)
+        assert (eq.high_freq, eq.high_gain_db) == (9952, -2.0)
+        assert (eq.low_cut, eq.high_cut) == (409, 10585)
+
+    def test_gain_encoding_matches_all_three_observed_points(self):
+        from mooer_ge150_mcp.protocol.commands import db_to_eq_gain, eq_gain_to_db
+
+        assert db_to_eq_gain(1.0) == 34
+        assert db_to_eq_gain(7.0) == 46
+        assert db_to_eq_gain(-2.0) == 28
+        assert eq_gain_to_db(32) == 0.0
+
+    def test_build_reproduces_the_captured_block(self):
+        from mooer_ge150_mcp.protocol.commands import (
+            Command, GlobalEQ, build_set_global_eq,
+        )
+        from mooer_ge150_mcp.protocol.framing import parse_frame
+
+        frame = parse_frame(build_set_global_eq(GlobalEQ(
+            enabled=True,
+            low_freq=6115, low_gain_db=1.0,
+            mid_freq=9217, mid_gain_db=7.0,
+            high_freq=9952, high_gain_db=-2.0,
+            low_cut=409, high_cut=10585,
+        )))
+        assert frame is not None
+        assert frame.command == Command.GLOBAL_EQ
+        expected = b"".join(
+            v.to_bytes(2, "little")
+            for v in [1, 6115, 34, 9217, 46, 9952, 28, 409, 10585]
+        )
+        assert frame.payload == expected

@@ -123,7 +123,10 @@ class Command(IntEnum):
     OTG_LEVEL_NOTIFY = 0x27
     SETTING_A8 = 0xA8  # u16; only seen during a restore
     SPILLOVER = 0xD2  # u16 boolean: delay/reverb trails
-    EXP_CALIBRATION = 0xD1  # 18 bytes, same shape as the 0x11 stream
+    # 0xD1 is the GLOBAL EQ block (test5.pcapng: eight edits from the
+    # editor, one field changing per message). Nine u16 words. The
+    # 0x11 stream shares this structure.
+    GLOBAL_EQ = 0xD1
     WRITE_STATE_8D = 0x8D  # 6 bytes, the writable form of 0x0C
 
     # --- miscellaneous, shape confirmed but meaning not pinned down -------
@@ -829,3 +832,76 @@ def split_user_model_list(names: list[str]) -> dict[str, list[dict]]:
         for i in range(USER_CAB_SLOTS)
     ]
     return {"amps": amps, "cabs": cabs}
+
+
+# ---------------------------------------------------------------------------
+# Global EQ (0xD1) -- decoded from log/test5.pcapng, eight edits with
+# user-annotated values.
+# ---------------------------------------------------------------------------
+
+#: Global EQ gain encoding: 32 is 0 dB, half a decibel per step.
+#: Three independent points confirm it: +1 dB -> 34, +7 dB -> 46,
+#: -2 dB -> 28.
+EQ_GAIN_ZERO = 32
+
+
+def eq_gain_to_db(value: int) -> float:
+    """Convert a raw global-EQ gain word to decibels."""
+    return (value - EQ_GAIN_ZERO) / 2
+
+
+def db_to_eq_gain(db: float) -> int:
+    """Convert decibels to the raw global-EQ gain word."""
+    return round(db * 2) + EQ_GAIN_ZERO
+
+
+@dataclass
+class GlobalEQ:
+    """The pedal's global EQ, independent of every preset's EQ module.
+
+    Frequencies are the raw wire values; the editor displays the three
+    band frequencies 30 higher than the wire carries (annotated 6145 /
+    9247 / 9982 arrived as 6115 / 9217 / 9952) while low_cut matched
+    exactly. Gains are in dB.
+    """
+
+    enabled: bool = False
+    low_freq: int = 0
+    low_gain_db: float = 0.0
+    mid_freq: int = 0
+    mid_gain_db: float = 0.0
+    high_freq: int = 0
+    high_gain_db: float = 0.0
+    low_cut: int = 0
+    high_cut: int = 0
+
+
+def build_set_global_eq(eq: GlobalEQ) -> bytes:
+    """Build a global EQ write (the whole block, as the editor sends it)."""
+    words = [
+        1 if eq.enabled else 0,
+        eq.low_freq, db_to_eq_gain(eq.low_gain_db),
+        eq.mid_freq, db_to_eq_gain(eq.mid_gain_db),
+        eq.high_freq, db_to_eq_gain(eq.high_gain_db),
+        eq.low_cut, eq.high_cut,
+    ]
+    for word in words:
+        if not 0 <= word <= 0xFFFF:
+            raise ValueError(f"Global EQ word out of range: {word}")
+    return build_command(
+        Command.GLOBAL_EQ, b"".join(w.to_bytes(2, "little") for w in words)
+    )
+
+
+def decode_global_eq(payload: bytes) -> GlobalEQ:
+    """Parse an 18-byte global EQ payload (0xD1 write or 0x11 stream)."""
+    if len(payload) != 18:
+        raise ValueError(f"Global EQ block must be 18 bytes, got {len(payload)}")
+    w = [int.from_bytes(payload[i:i+2], "little") for i in range(0, 18, 2)]
+    return GlobalEQ(
+        enabled=bool(w[0]),
+        low_freq=w[1], low_gain_db=eq_gain_to_db(w[2]),
+        mid_freq=w[3], mid_gain_db=eq_gain_to_db(w[4]),
+        high_freq=w[5], high_gain_db=eq_gain_to_db(w[6]),
+        low_cut=w[7], high_cut=w[8],
+    )

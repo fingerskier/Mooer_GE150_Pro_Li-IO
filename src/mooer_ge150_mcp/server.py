@@ -40,6 +40,9 @@ from .protocol.commands import (
     build_set_brightness,
     build_set_cab_sim_thru,
     build_set_spillover,
+    build_set_global_eq,
+    decode_global_eq,
+    GlobalEQ,
     build_restore_begin,
     build_restore_end,
     decode_ctrl_config,
@@ -1179,6 +1182,37 @@ def set_spillover(enabled: bool) -> dict[str, Any]:
     """
     _get_connection().write(build_set_spillover(enabled))
     return {"spillover": enabled}
+
+
+@mcp.tool()
+def set_global_eq(
+    enabled: bool,
+    low_freq: int = 0, low_gain_db: float = 0.0,
+    mid_freq: int = 0, mid_gain_db: float = 0.0,
+    high_freq: int = 0, high_gain_db: float = 0.0,
+    low_cut: int = 0, high_cut: int = 0,
+) -> dict[str, Any]:
+    """Set the pedal's global EQ (applies across all presets).
+
+    This is the manual's GLOBAL EQ, distinct from any preset's EQ
+    module. The whole block is written on every change, as the editor
+    does. Frequencies are raw wire values; the editor's display runs 30
+    higher for the three band frequencies. Gains are in dB, half-dB
+    steps.
+    """
+    eq = GlobalEQ(
+        enabled=enabled,
+        low_freq=low_freq, low_gain_db=low_gain_db,
+        mid_freq=mid_freq, mid_gain_db=mid_gain_db,
+        high_freq=high_freq, high_gain_db=high_gain_db,
+        low_cut=low_cut, high_cut=high_cut,
+    )
+    try:
+        report = build_set_global_eq(eq)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    _get_connection().write(report)
+    return {"global_eq": eq.__dict__}
 
 
 # ─── CTRL CONFIGURATION ───────────────────────────────────────────────
