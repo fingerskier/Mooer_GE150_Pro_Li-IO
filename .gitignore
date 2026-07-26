@@ -8,3 +8,5 @@ build/
 .eggs/
 *.egg
 node_modules/
+log/test4.pcapng
+log/test5.pcapng
