@@ -79,14 +79,41 @@ class Command(IntEnum):
     EXP_ASSIGN_NOTIFY = 0x18
     EXP_STREAM = 0x11  # 18 bytes, pedal -> host, position + calibration
 
-    # --- miscellaneous, shape confirmed but meaning not yet pinned down --
-    SETTING_A4 = 0xA4  # confirmed: single u16
-    SETTING_A5 = 0xA5  # confirmed: single u16
-    SETTING_A6 = 0xA6  # confirmed: two u16 flags
-    SETTING_A7 = 0xA7  # confirmed: single u16
+    # --- bulk preset transfer --------------------------------------------
+    # 0xC3 carries a whole 245-byte preset record, the same structure the
+    # dump returns, and is acked by 0x43 with the slot. This is a direct
+    # preset write, distinct from the select-edit-save path.
+    WRITE_PRESET = 0xC3
+    WRITE_PRESET_ACK = 0x43
+    BACKUP_BEGIN = 0xC4  # replies 0x44
+    BACKUP_BEGIN_ACK = 0x44
+    RESTORE_BEGIN = 0xBA
+    RESTORE_END = 0xBB
+
+    # --- per-preset CTRL configuration ------------------------------------
+    # Nine 0/1 flags, one per effect module in chain order: which modules
+    # the footswitch toggles for that preset (the manual's CTRL function).
+    # Slots here are 0-based, unlike the preset record's 1-based slot.
+    READ_CTRL_CONFIG = 0xA9  # 1-byte slot -> 0x29
+    CTRL_CONFIG = 0x29  # slot + 9 flags
+    WRITE_CTRL_CONFIG = 0xAB  # slot + 9 flags
+
+    # --- system settings (global) -----------------------------------------
+    INPUT_LEVEL = 0xA4  # u16; dB = (value - 9) / 2
+    INPUT_LEVEL_NOTIFY = 0x24
+    SCREEN_BRIGHTNESS = 0xA5  # u16, direct value
+    SCREEN_BRIGHTNESS_NOTIFY = 0x25
+    CAB_SIM_THRU = 0xA6  # [left u16, right u16]
+    OTG_LEVEL = 0xA7  # u16; dB = (value - 9) / 2
+    OTG_LEVEL_NOTIFY = 0x27
+    SETTING_A8 = 0xA8  # u16; only seen during a restore
+    SPILLOVER = 0xD2  # u16 boolean: delay/reverb trails
+    EXP_CALIBRATION = 0xD1  # 18 bytes, same shape as the 0x11 stream
+    WRITE_STATE_8D = 0x8D  # 6 bytes, the writable form of 0x0C
+
+    # --- miscellaneous, shape confirmed but meaning not pinned down -------
     SETTING_AC = 0xAC  # confirmed: 9-byte struct
     POLL = 0xB4  # confirmed: u16 selector, acked by 0x34
-    ASSIGNMENT = 0xD1  # confirmed: 18-byte assignment block
 
     # --- not observed in either capture ----------------------------------
     IDENTIFY = 0x10  # unverified
@@ -681,3 +708,134 @@ def build_set_system_setting(setting_index: int, value: int) -> bytes:
         value: Setting value.
     """
     return build_command(Command.SYSTEM, bytes([setting_index, value]))
+
+
+# ---------------------------------------------------------------------------
+# Bulk preset transfer, CTRL configuration and system settings
+#
+# All confirmed in log/test3.pcapng: a backup-to-file followed by a
+# restore-from-file, plus every system setting changed from the editor.
+# ---------------------------------------------------------------------------
+
+#: One CTRL flag per effect module, in chain order.
+CTRL_FLAG_COUNT = len(MODULE_CHAIN)
+
+#: System levels are stored as a u16 where 9 means 0 dB and each step is
+#: half a decibel. Confirmed at two points: input level 14 = +2.5 dB and
+#: OTG level 11 = +1.0 dB.
+LEVEL_ZERO_DB = 9
+LEVEL_DB_PER_STEP = 0.5
+
+
+def level_to_db(value: int) -> float:
+    """Convert a raw input/OTG level to decibels."""
+    return (value - LEVEL_ZERO_DB) * LEVEL_DB_PER_STEP
+
+
+def db_to_level(db: float) -> int:
+    """Convert decibels to the raw input/OTG level value."""
+    return round(db / LEVEL_DB_PER_STEP) + LEVEL_ZERO_DB
+
+
+def build_write_preset_record(record: PresetRecord) -> list[bytes]:
+    """Build a direct write of a complete preset record.
+
+    This is how the editor restores a backup: it sends the same 245-byte
+    structure the dump returns, and the pedal acks with 0x43 carrying the
+    slot. Unlike the select-edit-save path this does not disturb the
+    active preset.
+
+    Returns:
+        HID reports to send in order -- the record needs four of them.
+    """
+    return build_chunked_frames(
+        Command.WRITE_PRESET, encode_preset_record(record)
+    )
+
+
+def build_read_ctrl_config(slot: int) -> bytes:
+    """Read a preset's CTRL configuration. Note the slot is 0-based."""
+    if not 0 <= slot < LAST_PRESET_SLOT:
+        raise ValueError(f"CTRL slot must be 0-{LAST_PRESET_SLOT - 1}, got {slot}")
+    return build_command(Command.READ_CTRL_CONFIG, bytes([slot]))
+
+
+def build_write_ctrl_config(slot: int, flags: list[bool]) -> bytes:
+    """Write a preset's CTRL configuration.
+
+    Args:
+        slot: Preset slot, **0-based** here (0-199).
+        flags: One flag per effect module in chain order -- whether the
+            footswitch toggles that module for this preset.
+    """
+    if not 0 <= slot < LAST_PRESET_SLOT:
+        raise ValueError(f"CTRL slot must be 0-{LAST_PRESET_SLOT - 1}, got {slot}")
+    if len(flags) != CTRL_FLAG_COUNT:
+        raise ValueError(
+            f"Expected {CTRL_FLAG_COUNT} CTRL flags, got {len(flags)}"
+        )
+    return build_command(
+        Command.WRITE_CTRL_CONFIG,
+        bytes([slot]) + bytes(1 if f else 0 for f in flags),
+    )
+
+
+def decode_ctrl_config(payload: bytes) -> tuple[int, dict[Command, bool]]:
+    """Parse a CTRL_CONFIG (0x29) payload into (0-based slot, flags)."""
+    if len(payload) != 1 + CTRL_FLAG_COUNT:
+        raise ValueError(
+            f"CTRL config must be {1 + CTRL_FLAG_COUNT} bytes, got {len(payload)}"
+        )
+    return payload[0], {
+        command: bool(payload[1 + i]) for i, command in enumerate(MODULE_CHAIN)
+    }
+
+
+def _u16_command(command: Command, value: int) -> bytes:
+    if not 0 <= value <= 0xFFFF:
+        raise ValueError(f"Value must be 0-65535, got {value}")
+    return build_command(command, value.to_bytes(2, "little"))
+
+
+def build_set_input_level(value: int) -> bytes:
+    """Set the global input level, as a raw value (see :func:`db_to_level`)."""
+    return _u16_command(Command.INPUT_LEVEL, value)
+
+
+def build_set_otg_level(value: int) -> bytes:
+    """Set the global OTG output level, as a raw value."""
+    return _u16_command(Command.OTG_LEVEL, value)
+
+
+def build_set_brightness(value: int) -> bytes:
+    """Set screen brightness. Observed range in the editor: 8-17."""
+    return _u16_command(Command.SCREEN_BRIGHTNESS, value)
+
+
+def build_set_cab_sim_thru(left: bool, right: bool) -> bytes:
+    """Enable or disable cabinet simulation per output channel."""
+    return build_command(
+        Command.CAB_SIM_THRU,
+        (1 if left else 0).to_bytes(2, "little")
+        + (1 if right else 0).to_bytes(2, "little"),
+    )
+
+
+def build_set_spillover(enabled: bool) -> bytes:
+    """Enable or disable delay/reverb spill-over between presets."""
+    return _u16_command(Command.SPILLOVER, 1 if enabled else 0)
+
+
+def build_backup_begin() -> bytes:
+    """Open a backup read. The editor sends this before reading presets."""
+    return build_command(Command.BACKUP_BEGIN, b"\x01")
+
+
+def build_restore_begin() -> bytes:
+    """Open a restore. Bracket the whole restore between this and the end."""
+    return build_command(Command.RESTORE_BEGIN, b"\x01")
+
+
+def build_restore_end() -> bytes:
+    """Close a restore."""
+    return build_command(Command.RESTORE_END, b"\x01")

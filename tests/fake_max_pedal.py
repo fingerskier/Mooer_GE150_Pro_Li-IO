@@ -82,6 +82,11 @@ class FakeMaxPedal:
         self.written_blocks: list[tuple[int, ModuleBlock]] = []
         self.selected: list[int] = []
         self.saves: list[tuple[int, bytes]] = []
+        self.uploaded: list[int] = []
+        self.settings: dict[Command, list[int]] = {}
+        self.ctrl_flags: list[list[bool]] = [
+            [False] * len(MODULE_CHAIN) for _ in range(NUM_SLOTS)
+        ]
         self._rx_buffer = b""
         self._rx_expected: int | None = None
         self._tx_reports: deque[bytes] = deque()
@@ -179,6 +184,37 @@ class FakeMaxPedal:
                 )
                 self.saves.append((slot, name))
             self._respond(Command.PRESET_NAME_NOTIFY, payload)
+
+        elif command == Command.WRITE_PRESET:
+            from mooer_ge150_mcp.protocol.commands import decode_preset_record
+
+            record = decode_preset_record(payload)
+            self.records[record.slot] = record
+            self.uploaded.append(record.slot)
+            self._respond(Command.WRITE_PRESET_ACK, bytes([record.slot]))
+
+        elif command == Command.READ_CTRL_CONFIG:
+            slot = payload[0]
+            flags = self.ctrl_flags[slot]
+            self._respond(
+                Command.CTRL_CONFIG,
+                bytes([slot]) + bytes(1 if f else 0 for f in flags),
+            )
+
+        elif command == Command.WRITE_CTRL_CONFIG:
+            self.ctrl_flags[payload[0]] = [bool(b) for b in payload[1:]]
+
+        elif command in (
+            Command.INPUT_LEVEL,
+            Command.OTG_LEVEL,
+            Command.SCREEN_BRIGHTNESS,
+            Command.CAB_SIM_THRU,
+            Command.SPILLOVER,
+        ):
+            self.settings[Command(command)] = [
+                int.from_bytes(payload[i : i + 2], "little")
+                for i in range(0, len(payload), 2)
+            ]
 
         # Anything else is deliberately unanswered: the captures do not
         # show a reply, so tests must not depend on one.

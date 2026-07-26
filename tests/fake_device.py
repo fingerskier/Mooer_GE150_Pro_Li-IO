@@ -98,7 +98,7 @@ class FakePedal:
                 PRESET_SIZE, b"\x00"
             )
             self._respond(command, bytes([slot]))
-        elif command == Command.SETTING_A6:
+        elif command == Command.CAB_SIM_THRU:
             if len(payload) >= 1:
                 self.active_slot = payload[0]
             self._respond(command, bytes([self.active_slot]))

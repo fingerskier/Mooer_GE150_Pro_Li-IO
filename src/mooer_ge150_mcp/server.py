@@ -32,6 +32,21 @@ from .protocol.commands import (
     build_select_preset_slot,
     build_set_exp_assign,
     build_write_preset,
+    build_write_preset_record,
+    build_read_ctrl_config,
+    build_write_ctrl_config,
+    build_set_input_level,
+    build_set_otg_level,
+    build_set_brightness,
+    build_set_cab_sim_thru,
+    build_set_spillover,
+    build_restore_begin,
+    build_restore_end,
+    decode_ctrl_config,
+    db_to_level,
+    level_to_db,
+    CTRL_FLAG_COUNT,
+    PresetRecord,
     slot_to_address,
     IR_EMPTY_NAME,
     MAX_MODULE_PARAMS,
@@ -574,28 +589,21 @@ def toggle_effect(module: str, enabled: bool) -> dict[str, Any]:
 
 @mcp.tool()
 def set_effect_order(order: list[str]) -> dict[str, Any]:
-    """Change the signal chain order.
+    """Not supported: this pedal's effect chain order is fixed.
 
-    Args:
-        order: List of module names in desired order,
-               e.g. ["fx", "od", "amp", "cab", "ns", "eq", "mod", "delay", "reverb"].
+    Every preset carries exactly nine module blocks in the manual's chain
+    order (FX, DS, AMP, CAB, NS, EQ, MOD, DELAY, REVERB) and no captured
+    traffic reorders them.
+
+    This previously sent its byte array under command 0xA5, which is in
+    fact screen brightness -- calling it dimmed the display instead of
+    reordering anything.
     """
-    valid = set(MODULE_CLASSES.keys())
-    for m in order:
-        if m not in valid:
-            return {"error": f"Unknown module '{m}' in order. Valid: {sorted(valid)}"}
-
-    # Build order byte array (maps position -> module index)
-    module_index_map = {name: i for i, name in enumerate(MODULE_NAMES)}
-    order_bytes = bytes([module_index_map.get(m, 0) for m in order])
-    # Pad to 10 bytes
-    order_bytes = order_bytes.ljust(10, b"\x00")
-
-    conn = _get_connection()
-    frame = build_command(Command.SETTING_A5, order_bytes)
-    conn.write(frame)
-
-    return {"order": order}
+    return {
+        "error": "The effect chain order is fixed on this pedal.",
+        "chain": list(MODULE_COMMAND_MAP),
+        "requested": order,
+    }
 
 
 # ─── SYSTEM SETTINGS TOOLS ───────────────────────────────────────────
@@ -962,6 +970,184 @@ def set_expression_target(target: int, enabled: int = 1) -> dict[str, Any]:
     except ValueError as exc:
         return {"error": str(exc)}
     return {"target": target, "enabled": enabled}
+
+
+# ─── SYSTEM SETTINGS (CAPTURE-CONFIRMED) ──────────────────────────────
+
+@mcp.tool()
+def set_input_level(db: float) -> dict[str, Any]:
+    """Set the global input level in decibels.
+
+    Applies to all presets. The manual's range is -inf to +6 dB; the
+    encoding was read off the wire (9 = 0 dB, half a decibel per step).
+
+    Args:
+        db: Level in decibels, e.g. 2.5.
+    """
+    value = db_to_level(db)
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Level {db} dB is out of range"}
+    _get_connection().write(build_set_input_level(value))
+    return {"db": level_to_db(value), "raw": value}
+
+
+@mcp.tool()
+def set_otg_level(db: float) -> dict[str, Any]:
+    """Set the global OTG output level in decibels.
+
+    Args:
+        db: Level in decibels, e.g. 1.0.
+    """
+    value = db_to_level(db)
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Level {db} dB is out of range"}
+    _get_connection().write(build_set_otg_level(value))
+    return {"db": level_to_db(value), "raw": value}
+
+
+@mcp.tool()
+def set_screen_brightness(value: int) -> dict[str, Any]:
+    """Set the pedal's screen brightness. The editor uses 8-17.
+
+    Args:
+        value: Brightness level.
+    """
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Brightness must be 0-65535, got {value}"}
+    _get_connection().write(build_set_brightness(value))
+    return {"brightness": value}
+
+
+@mcp.tool()
+def set_cab_sim_thru(left: bool, right: bool) -> dict[str, Any]:
+    """Enable or disable cabinet simulation on each output channel.
+
+    Args:
+        left: Cab sim on the left output.
+        right: Cab sim on the right output.
+    """
+    _get_connection().write(build_set_cab_sim_thru(left, right))
+    return {"left": left, "right": right}
+
+
+@mcp.tool()
+def set_spillover(enabled: bool) -> dict[str, Any]:
+    """Enable or disable delay/reverb spill-over between preset changes.
+
+    Args:
+        enabled: True to let trails ring out across a preset change.
+    """
+    _get_connection().write(build_set_spillover(enabled))
+    return {"spillover": enabled}
+
+
+# ─── CTRL CONFIGURATION ───────────────────────────────────────────────
+
+@mcp.tool()
+def get_ctrl_config(slot: int) -> dict[str, Any]:
+    """Read which modules a preset's footswitch toggles (its CTRL setup).
+
+    Args:
+        slot: Preset slot 0-199.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    conn = _get_connection()
+    response = conn.send_and_expect(
+        build_read_ctrl_config(slot), Command.CTRL_CONFIG
+    )
+    if response is None:
+        return {"error": "No CTRL config reply from device"}
+
+    _, flags = decode_ctrl_config(response.payload)
+    names = {command: name for name, command in MODULE_COMMAND_MAP.items()}
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "toggles": {names[c]: v for c, v in flags.items()},
+    }
+
+
+@mcp.tool()
+def set_ctrl_config(slot: int, modules: list[str]) -> dict[str, Any]:
+    """Choose which modules a preset's footswitch toggles.
+
+    Args:
+        slot: Preset slot 0-199.
+        modules: Module names the footswitch should toggle, e.g.
+            ["delay", "reverb"]. Any not listed are left untouched by it.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    wanted = set()
+    for name in modules:
+        key = MODULE_NAME_ALIASES.get(name.lower(), name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return {
+                "error": f"Unknown module '{name}'. "
+                         f"Valid: {list(MODULE_COMMAND_MAP)}"
+            }
+        wanted.add(MODULE_COMMAND_MAP[key])
+
+    flags = [c in wanted for c in MODULE_CHAIN]
+    _get_connection().write(build_write_ctrl_config(slot, flags))
+    return {"slot": slot, "toggles": sorted(m.lower() for m in modules)}
+
+
+# ─── DIRECT PRESET WRITE ──────────────────────────────────────────────
+
+@mcp.tool()
+def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
+    """Write a complete preset record directly to a slot.
+
+    This is how the editor restores a backup. Unlike write_preset it does
+    not select the slot or disturb the active preset -- the whole record
+    is uploaded in one message.
+
+    Args:
+        slot: Target preset slot 0-199.
+        preset: A preset as returned by get_preset -- ``name`` plus
+            ``modules``, each with enabled / effect_type / params.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    record = PresetRecord(slot=slot + FIRST_PRESET_SLOT)
+    record = record.with_name(str(preset.get("name", "")))
+
+    blocks: dict[Any, Any] = {}
+    for name, state in (preset.get("modules") or {}).items():
+        key = MODULE_NAME_ALIASES.get(name.lower(), name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return {"error": f"Unknown module '{name}'"}
+        try:
+            blocks[MODULE_COMMAND_MAP[key]] = ModuleBlock(
+                enabled=bool(state.get("enabled", True)),
+                effect_type=int(state.get("effect_type", 0)),
+                params=[int(v) for v in state.get("params", [])],
+            )
+        except (TypeError, ValueError) as exc:
+            return {"error": f"Bad state for module '{name}': {exc}"}
+
+    for command in MODULE_CHAIN:
+        blocks.setdefault(command, ModuleBlock(enabled=False, effect_type=0))
+    record.modules = blocks
+
+    conn = _get_connection()
+    for report in build_write_preset_record(record):
+        conn.write(report)
+    ack = conn.read_message()
+
+    _record_cache.clear()
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": record.name,
+        "acknowledged": ack is not None
+        and ack.command == Command.WRITE_PRESET_ACK,
+    }
 
 
 # ─── MCP RESOURCES ───────────────────────────────────────────────────

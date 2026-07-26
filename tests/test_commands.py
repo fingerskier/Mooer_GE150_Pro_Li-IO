@@ -31,7 +31,7 @@ def test_command_enum_values():
     assert Command.REVERB == 0x8A
     assert Command.READ_PRESET == 0x96
     assert Command.PRESET_NAME == 0x97
-    assert Command.SETTING_A6 == 0xA6
+    assert Command.CAB_SIM_THRU == 0xA6
     assert Command.POLL == 0xB4
 
     assert Command.IDENTIFY == 0x10
