@@ -1,5 +1,8 @@
 # Mooer GE150 Pro Li — Communication Protocol & MCP Server Specification
 
+> **Terminology:** see [`GLOSSARY.md`](GLOSSARY.md) for the owner's manual's
+> vocabulary, which this document predates.
+>
 > **Superseded in part by a real USB capture.** Much of this document was
 > written before any traffic from the pedal had been observed. The USB IDs,
 > endpoints, frame checksum and command IDs have since been derived from

@@ -157,7 +157,7 @@ class TestModuleBlock:
             bytes.fromhex("010011005a001e0017004c00500041000000000000000000")
         )
         assert block.enabled is True
-        assert block.model == 17
+        assert block.effect_type == 17
         assert block.params[:6] == [90, 30, 23, 76, 80, 65]
 
     def test_decode_disabled_block_from_capture(self):
@@ -166,22 +166,22 @@ class TestModuleBlock:
             bytes.fromhex("000013003700280046000000000000000000000000000000")
         )
         assert block.enabled is False
-        assert block.model == 19
+        assert block.effect_type == 19
 
     def test_encode_reproduces_captured_payload(self):
         payload = bytes.fromhex(
             "010011005a001e0017004c00500041000000000000000000"
         )
         block = ModuleBlock(
-            enabled=True, model=17, params=[90, 30, 23, 76, 80, 65]
+            enabled=True, effect_type=17, params=[90, 30, 23, 76, 80, 65]
         )
         assert encode_module_block(block) == payload
 
     def test_encode_decode_round_trip(self):
-        block = ModuleBlock(enabled=False, model=3, params=[50, 50, 1040, 1])
+        block = ModuleBlock(enabled=False, effect_type=3, params=[50, 50, 1040, 1])
         decoded = decode_module_block(encode_module_block(block))
         assert decoded.enabled is False
-        assert decoded.model == 3
+        assert decoded.effect_type == 3
         assert decoded.params[:4] == [50, 50, 1040, 1]
 
     def test_too_many_params_is_rejected(self):

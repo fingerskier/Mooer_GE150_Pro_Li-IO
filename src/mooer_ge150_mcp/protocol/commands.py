@@ -26,7 +26,7 @@ RESPONSE_MASK = 0x7F
 #: Effect module blocks are a fixed 12 little-endian u16 words.
 MODULE_BLOCK_WORDS = 12
 MODULE_BLOCK_SIZE = MODULE_BLOCK_WORDS * 2
-#: Words 0 and 1 are the enable flag and model index; the rest are params.
+#: Words 0 and 1 are the ON/OFF status and effect type; the rest are parameters.
 MAX_MODULE_PARAMS = MODULE_BLOCK_WORDS - 2
 
 
@@ -40,7 +40,7 @@ class Command(IntEnum):
     # crossover frequencies 100/600/1250. AMP/CAB are pinned by the
     # amp-selects-cabinet push (editing 0x84 makes the pedal send 0x05).
     FX = 0x82  # 4 params
-    DRIVE = 0x83  # 3 params
+    DS = 0x83  # overdrive / distortion; 3 params
     AMP = 0x84  # 6 params
     CAB = 0x85
     NS = 0x86  # 3 params; identity by elimination
@@ -89,7 +89,7 @@ class Command(IntEnum):
 #: its module blocks in exactly this order.
 MODULE_CHAIN: list[Command] = [
     Command.FX,
-    Command.DRIVE,
+    Command.DS,
     Command.AMP,
     Command.CAB,
     Command.NS,
@@ -103,10 +103,11 @@ MODULE_CHAIN: list[Command] = [
 FIRST_MODULE_COMMAND = Command.FX
 LAST_MODULE_COMMAND = Command.REVERB
 
-#: Mapping from human-readable module names to command IDs.
+#: Mapping from module name to command ID, in effect-chain order. These are
+#: the owner's manual's own module names (see GLOSSARY.md).
 MODULE_COMMAND_MAP: dict[str, Command] = {
     "fx": Command.FX,
-    "od": Command.DRIVE,
+    "ds": Command.DS,
     "amp": Command.AMP,
     "cab": Command.CAB,
     "ns": Command.NS,
@@ -116,6 +117,10 @@ MODULE_COMMAND_MAP: dict[str, Command] = {
     "reverb": Command.REVERB,
 }
 
+#: Accepted aliases for module names. "od" predates the manual check --
+#: the pedal calls the overdrive/distortion module DS.
+MODULE_NAME_ALIASES: dict[str, str] = {"od": "ds", "drive": "ds"}
+
 #: Length of the ASCII name field in a PRESET_NAME message.
 PRESET_NAME_LENGTH = 16
 
@@ -123,6 +128,13 @@ PRESET_NAME_LENGTH = 16
 #: PRESET_NAME. Note that the 0x29 reply reports the same slot 0-based.
 FIRST_PRESET_SLOT = 1
 LAST_PRESET_SLOT = 200
+
+#: Presets are addressed as a bank (1-50) and a position (A-D) on the
+#: pedal itself; "slot" is our flat index behind that. See GLOSSARY.md.
+PRESETS_PER_BANK = 4
+FIRST_BANK = 1
+LAST_BANK = 50
+PRESET_POSITIONS = "ABCD"
 
 #: A preset record: slot byte, 16-byte name, nine module blocks, 12-byte tail.
 PRESET_TAIL_SIZE = 12
@@ -135,6 +147,44 @@ PRESET_RECORD_SIZE = (
 def response_command(command: int) -> int:
     """Return the reply ID the device uses for *command*."""
     return int(command) & RESPONSE_MASK
+
+
+def slot_to_address(slot: int) -> str:
+    """Render a 1-based slot as the address the pedal displays.
+
+    >>> slot_to_address(1)
+    '1A'
+    >>> slot_to_address(193)
+    '49A'
+    """
+    if not FIRST_PRESET_SLOT <= slot <= LAST_PRESET_SLOT:
+        raise ValueError(
+            f"Preset slot must be {FIRST_PRESET_SLOT}-{LAST_PRESET_SLOT}, "
+            f"got {slot}"
+        )
+    index = slot - FIRST_PRESET_SLOT
+    bank = index // PRESETS_PER_BANK + FIRST_BANK
+    return f"{bank}{PRESET_POSITIONS[index % PRESETS_PER_BANK]}"
+
+
+def address_to_slot(bank: int, position: str) -> int:
+    """Convert a bank (1-50) and position (A-D) to a 1-based slot.
+
+    >>> address_to_slot(49, "A")
+    193
+    """
+    if not FIRST_BANK <= bank <= LAST_BANK:
+        raise ValueError(f"Bank must be {FIRST_BANK}-{LAST_BANK}, got {bank}")
+    letter = position.upper()
+    if letter not in PRESET_POSITIONS:
+        raise ValueError(
+            f"Preset position must be one of {PRESET_POSITIONS}, got {position!r}"
+        )
+    return (
+        (bank - FIRST_BANK) * PRESETS_PER_BANK
+        + PRESET_POSITIONS.index(letter)
+        + FIRST_PRESET_SLOT
+    )
 
 
 def build_command(command: Command, payload: bytes = b"") -> bytes:
@@ -151,13 +201,16 @@ def build_command(command: Command, payload: bytes = b"") -> bytes:
 class ModuleBlock:
     """The state of one effect module.
 
-    A module block is always 12 little-endian u16 words: an enable flag,
-    a model index, then up to 10 parameter values. Unused parameter slots
-    are zero-filled.
+    A module block is always 12 little-endian u16 words: the module's
+    ON/OFF status, its effect type, then up to 10 parameter values.
+    Unused parameter slots are zero-filled.
+
+    Terminology follows the owner's manual (see GLOSSARY.md): the choice
+    of effect within a module is its *effect type*, not its "model".
     """
 
     enabled: bool
-    model: int
+    effect_type: int
     params: list[int] = field(default_factory=list)
 
 
@@ -169,7 +222,7 @@ def encode_module_block(block: ModuleBlock) -> bytes:
             f"got {len(block.params)}"
         )
 
-    words = [1 if block.enabled else 0, block.model, *block.params]
+    words = [1 if block.enabled else 0, block.effect_type, *block.params]
     for word in words:
         if not 0 <= word <= 0xFFFF:
             raise ValueError(f"Module word must be 0-65535, got {word}")
@@ -190,15 +243,18 @@ def decode_module_block(payload: bytes) -> ModuleBlock:
         int.from_bytes(payload[i : i + 2], "little")
         for i in range(0, MODULE_BLOCK_SIZE, 2)
     ]
-    return ModuleBlock(enabled=bool(words[0]), model=words[1], params=words[2:])
+    return ModuleBlock(
+        enabled=bool(words[0]), effect_type=words[1], params=words[2:]
+    )
 
 
 def _module_command(module: str) -> Command:
-    if module not in MODULE_COMMAND_MAP:
+    name = MODULE_NAME_ALIASES.get(module.lower(), module.lower())
+    if name not in MODULE_COMMAND_MAP:
         raise ValueError(
             f"Unknown module '{module}'. Valid: {list(MODULE_COMMAND_MAP)}"
         )
-    return MODULE_COMMAND_MAP[module]
+    return MODULE_COMMAND_MAP[name]
 
 
 def build_module_block(module: str, block: ModuleBlock) -> bytes:
@@ -297,7 +353,7 @@ def encode_preset_record(record: PresetRecord) -> bytes:
 
     out = bytes([record.slot]) + record.name_raw
     for command in MODULE_CHAIN:
-        block = record.modules.get(command, ModuleBlock(False, 0))
+        block = record.modules.get(command, ModuleBlock(enabled=False, effect_type=0))
         out += encode_module_block(block)
     return out + record.tail
 

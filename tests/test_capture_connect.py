@@ -225,7 +225,7 @@ class TestPedalOriginatedNotifications:
             "00"
         )
         assert response_command(Command.FX) == 0x02
-        block = ModuleBlock(enabled=False, model=6, params=[50, 50, 50, 50])
+        block = ModuleBlock(enabled=False, effect_type=6, params=[50, 50, 50, 50])
         from mooer_ge150_mcp.protocol.commands import encode_module_block
 
         assert encode_module_block(block) == payload

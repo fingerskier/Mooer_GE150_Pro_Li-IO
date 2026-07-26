@@ -72,3 +72,10 @@ python -m build
 twine upload dist/*
 ```
 
+## Documentation
+
+- [`GLOSSARY.md`](GLOSSARY.md) — terminology, taken from the owner's manual.
+  Read this first; the pedal's vocabulary is precise and easy to get wrong.
+- [`log/CAPTURE_ANALYSIS.md`](log/CAPTURE_ANALYSIS.md) — the USB protocol as
+  derived from real captures, with confirmed-vs-inferred grading.
+- [`SPEC.md`](SPEC.md) — the original design spec, partly superseded by the above.
