@@ -179,6 +179,50 @@ class USBConnection:
             self._connected = False
             logger.info("Disconnected")
 
+    def reconnect(self, timeout_s: float = 20.0) -> bool:
+        """Re-open the device after it re-enumerates.
+
+        RESTORE_END (0xBB) makes the pedal reboot and re-enumerate by
+        design -- MOOER Studio's own restore shows the same USB address
+        change. Polls for the device and reopens the same interface.
+        """
+        import hid
+
+        try:
+            if self._device is not None:
+                self._device.close()
+        except Exception:
+            pass
+        self._connected = False
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            time.sleep(1.0)
+            try:
+                infos = hid.enumerate(self._vendor_id, self._product_id)
+            except Exception:
+                continue
+            target = next(
+                (i for i in infos
+                 if i.get("interface_number") == HID_INTERFACE),
+                None,
+            )
+            if target is None:
+                continue
+            try:
+                device = hid.device()
+                device.open_path(target["path"])
+                device.set_nonblocking(False)
+            except Exception:
+                continue
+            self._device = device
+            self._backend = "hidapi"
+            self._connected = True
+            logger.info("Reconnected after device re-enumeration")
+            return True
+        logger.warning("Device did not come back within %.0fs", timeout_s)
+        return False
+
     def write(self, data: bytes) -> int:
         """Write a 64-byte HID report to the device.
 

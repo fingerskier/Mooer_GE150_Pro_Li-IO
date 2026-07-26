@@ -60,6 +60,7 @@ from .protocol.commands import (
     MAX_MODULE_PARAMS,
     MODULE_NAME_ALIASES,
     ModuleBlock,
+    encode_module_block,
     encode_preset_record,
     PRESET_RECORD_SIZE,
     build_command,
@@ -248,6 +249,37 @@ def _upload_records(conn, records: list) -> int:
         conn.write(build_restore_end())
     _record_cache.clear()
     return acked
+
+
+def _write_record_live(conn, slot: int, record) -> bool:
+    """Write a record's modules + name via the live path: select the
+    slot, write each module block, then commit with SAVE (0x97).
+
+    Unlike the 0xC3 bracket this does not reboot the pedal, so it is the
+    right shape for interactive single-slot writes. The 12-byte tail is
+    not writable this way; the slot keeps its existing tail.
+
+    Args:
+        conn: Open connection.
+        slot: Wire slot, 1-based.
+        record: PresetRecord whose modules and name to write.
+
+    Returns:
+        True if the pedal echoed the save (0x17).
+    """
+    conn.write(build_select_preset_slot(slot))
+    time.sleep(0.1)
+    for command in MODULE_CHAIN:
+        block = record.modules.get(command)
+        if block is None:
+            continue
+        conn.write(build_command(command, encode_module_block(block)))
+        time.sleep(WRITE_PACING_SECONDS)
+    ack = conn.send_and_expect(
+        build_save_preset(slot, record.name), Command.PRESET_NAME_NOTIFY
+    )
+    _record_cache.clear()
+    return ack is not None
 
 
 def _merge_module_states(
@@ -479,16 +511,15 @@ def set_preset(
         for command in MODULE_CHAIN:
             record.modules[command] = ModuleBlock(enabled=False, effect_type=0)
 
-    if name is not None:
-        record = record.with_name(name)
-
     error = _merge_module_states(record, effects or {})
     if error:
         return {"error": error}
 
-    acked = _upload_records(conn, [record])
+    if name is not None:
+        record = record.with_name(name)
+    stored = _write_record_live(conn, slot + FIRST_PRESET_SLOT, record)
     return {
-        "stored": acked == 1,
+        "stored": stored,
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
         "name": record.name,
@@ -531,16 +562,20 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
     if source is None:
         return {"error": f"Device did not return a record for slot {from_slot}"}
 
-    raw = bytearray(encode_preset_record(source))
-    raw[0] = to_slot + FIRST_PRESET_SLOT
-    duplicate = decode_preset_record(bytes(raw))
-
-    acked = _upload_records(conn, [duplicate])
+    # The editor's own "save as": select the source so its state is
+    # live, then commit that state to the destination slot.
+    conn.write(build_select_preset_slot(from_slot + FIRST_PRESET_SLOT))
+    time.sleep(0.1)
+    ack = conn.send_and_expect(
+        build_save_preset(to_slot + FIRST_PRESET_SLOT, source.name),
+        Command.PRESET_NAME_NOTIFY,
+    )
+    _record_cache.clear()
     return {
-        "copied": acked == 1,
+        "copied": ack is not None,
         "from": from_slot,
         "to": to_slot,
-        "name": duplicate.name,
+        "name": source.name,
     }
 
 
@@ -561,16 +596,10 @@ def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
     if rec_a is None or rec_b is None:
         return {"error": "Device did not return both preset records"}
 
-    raw_a = bytearray(encode_preset_record(rec_a))
-    raw_b = bytearray(encode_preset_record(rec_b))
-    raw_a[0] = slot_b + FIRST_PRESET_SLOT
-    raw_b[0] = slot_a + FIRST_PRESET_SLOT
-
-    acked = _upload_records(
-        conn,
-        [decode_preset_record(bytes(raw_a)), decode_preset_record(bytes(raw_b))],
-    )
-    return {"swapped": acked == 2, "slot_a": slot_a, "slot_b": slot_b}
+    ok_a = _write_record_live(conn, slot_a + FIRST_PRESET_SLOT, rec_b)
+    time.sleep(0.2)
+    ok_b = _write_record_live(conn, slot_b + FIRST_PRESET_SLOT, rec_a)
+    return {"swapped": ok_a and ok_b, "slot_a": slot_a, "slot_b": slot_b}
 
 
 # ─── EFFECT PARAMETER TOOLS ──────────────────────────────────────────
@@ -793,6 +822,10 @@ def backup_all(output_path: str) -> dict[str, Any]:
 def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
     """Restore presets from a backup file made by backup_all.
 
+    The pedal REBOOTS when the restore completes (by design -- MOOER
+    Studio's restore does the same); the connection reconnects
+    automatically afterwards.
+
     Occupied slots are never clobbered by empty backup entries. With
     ``overwrite=False`` occupied slots are skipped entirely; with
     ``overwrite=True`` named backup entries replace them.
@@ -840,7 +873,13 @@ def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
         to_write.append(record)
 
     acked = _upload_records(conn, to_write) if to_write else 0
-    result: dict[str, Any] = {"restored": True, "preset_count": acked}
+    # RESTORE_END reboots the pedal by design; ride through it.
+    reconnected = conn.reconnect() if to_write else True
+    result: dict[str, Any] = {
+        "restored": True,
+        "preset_count": acked,
+        "reconnected": reconnected,
+    }
     if skipped:
         result["skipped_slots"] = sorted(skipped)
     if acked != len(to_write):
@@ -903,9 +942,11 @@ def import_preset(input_path: str, slot: int) -> dict[str, Any]:
     except (KeyError, TypeError, ValueError) as exc:
         return {"error": f"Malformed preset file: {exc}"}
 
-    acked = _upload_records(_get_connection(), [record])
+    stored = _write_record_live(
+        _get_connection(), slot + FIRST_PRESET_SLOT, record
+    )
     return {
-        "imported": acked == 1,
+        "imported": stored,
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
         "name": record.name,
@@ -1295,9 +1336,12 @@ def set_ctrl_config(slot: int, modules: list[str]) -> dict[str, Any]:
 def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
     """Write a complete preset record directly to a slot.
 
-    This is how the editor restores a backup. Unlike write_preset it does
-    not select the slot or disturb the active preset -- the whole record
-    is uploaded in one message.
+    This is the restore-style write: byte-exact including the tail, but
+    THE PEDAL REBOOTS a moment after (RESTORE_END does that by design,
+    exactly as after MOOER Studio's own restore). Prefer set_preset /
+    write_preset for interactive edits; use this when byte fidelity
+    matters and a reboot is acceptable. The connection reconnects
+    automatically.
 
     Args:
         slot: Target preset slot 0-199.
@@ -1328,12 +1372,15 @@ def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
         blocks.setdefault(command, ModuleBlock(enabled=False, effect_type=0))
     record.modules = blocks
 
-    acked = _upload_records(_get_connection(), [record])
+    conn = _get_connection()
+    acked = _upload_records(conn, [record])
+    reconnected = conn.reconnect()
     return {
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
         "name": record.name,
         "acknowledged": acked == 1,
+        "reconnected": reconnected,
     }
 
 

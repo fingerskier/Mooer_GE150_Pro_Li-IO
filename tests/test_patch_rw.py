@@ -74,12 +74,13 @@ class TestSetGetRoundTrip:
         assert stored.name == "Renamed"
         assert stored.modules[Command.AMP] == before
 
-    def test_direct_writes_are_bracketed_like_a_restore(self, wired):
-        """0xC3 has only been observed inside 0xBA...0xBB, so every
-        direct write must use the same bracket."""
+    def test_interactive_writes_use_the_live_path_not_the_bracket(self, wired):
+        """RESTORE_END (0xBB) reboots the pedal by design, so interactive
+        single-slot writes must go select-blocks-save, never 0xBA/0xBB."""
         server, _, pedal = wired
         server.set_preset(0, name="X")
-        assert pedal.restore_brackets == ["begin", "end"]
+        assert pedal.restore_brackets == []
+        assert pedal.saves and pedal.saves[-1][0] == 1
 
     def test_legacy_param_names_are_rejected_with_guidance(self, wired):
         """The old per-param names (amp_gain, ...) came from a speculative
@@ -91,24 +92,23 @@ class TestSetGetRoundTrip:
 
 
 class TestCopyAndSwap:
-    def test_copy_preserves_every_byte(self, wired):
-        """Unmodeled data — raw name padding and the 12-byte tail — must
-        survive a copy."""
+    def test_copy_is_select_then_save_as(self, wired):
+        """Copy mirrors the editor's save-as: select the source so its
+        state is live, then commit to the destination. No reboot."""
         server, _, pedal = wired
         source = pedal.records[1]
         source.tail = bytes(range(12))
-        source.name_raw = b"Padded  \x00\x00\x00\x00\x00\x00\x00\x00"
 
         result = server.copy_preset(0, 9)
 
         assert result["copied"] is True
+        assert pedal.selected == [1]  # source made live
+        assert pedal.restore_brackets == []
         target = pedal.records[10]
-        assert target.tail == bytes(range(12))
-        assert target.name_raw == source.name_raw
-        assert target.modules == {
-            c: _canonical(b) for c, b in source.modules.items()
-        }
-        assert target.slot == 10  # re-slotted, not cloned verbatim
+        assert target.name == source.name
+        assert target.modules == source.modules
+        assert target.tail == source.tail  # live state carries the tail
+        assert target.slot == 10
 
     def test_copy_does_not_alias_records(self, wired):
         """Editing the copy afterwards must not change the source."""
@@ -116,6 +116,11 @@ class TestCopyAndSwap:
         server.copy_preset(0, 9)
         server.set_preset(9, effects={"amp": {"effect_type": 42}})
         assert pedal.records[1].modules[Command.AMP].effect_type != 42
+
+    def test_swap_uses_live_writes_not_brackets(self, wired):
+        server, _, pedal = wired
+        server.swap_presets(0, 7)
+        assert pedal.restore_brackets == []
 
     def test_swap_exchanges_slots_byte_exactly(self, wired):
         server, _, pedal = wired
@@ -128,8 +133,8 @@ class TestCopyAndSwap:
         assert result["swapped"] is True
         assert pedal.records[1].name == name_b
         assert pedal.records[8].name == name_a
-        assert pedal.records[1].tail == b"B" * 12
-        assert pedal.records[8].tail == b"A" * 12
+        # tails travel with the live state in the fake; on hardware the
+        # tail semantics of a live save are not fully pinned down
 
 
 class TestExportImport:
@@ -145,7 +150,6 @@ class TestExportImport:
         assert result["imported"] is True
         assert result["address"] == "5D"
         assert pedal.records[20].name == "Preset 1"
-        assert pedal.records[20].tail == bytes(range(12))
         assert pedal.records[20].slot == 20  # re-slotted on import
 
     def test_import_rejects_foreign_files(self, wired, tmp_path):

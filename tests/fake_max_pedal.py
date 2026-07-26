@@ -278,4 +278,7 @@ def make_max_connection(
     conn._device = pedal
     conn._backend = "hidapi"
     conn._connected = True
+    # reconnect() enumerates real HID devices; a test must never be able
+    # to reach actual hardware (it did once, and read a live pedal).
+    conn.reconnect = lambda timeout_s=20.0: True
     return conn, pedal
