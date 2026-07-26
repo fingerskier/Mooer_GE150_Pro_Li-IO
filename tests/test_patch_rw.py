@@ -1,310 +1,194 @@
-"""End-to-end read/write tests for patches (presets).
+"""Preset read/write round-trips through the capture-confirmed protocol.
 
-These tests run the real protocol and transport code against a
-``FakePedal`` (tests/fake_device.py) that emulates the device at the
-64-byte HID report level, so every test covers:
+These are the contracts the legacy patch-R/W suite pinned — merge-over-
+existing, byte-exact copy/swap, export/import and backup/restore — now
+exercised end-to-end against ``FakeMaxPedal``: bulk dump (0xA0/0x20) for
+reads and bracketed direct writes (0xBA, 0xC3→0x43, 0xBB) for writes.
 
-    Preset model → store frames → chunked TX → device →
-    chunked RX → reassembly → parse → Preset model
-
-See TESTING.md for the full patch R/W test process, including the
-hardware-in-the-loop procedure this suite mirrors.
+The old suite drove a fake speaking the pre-capture protocol (0x96 reads,
+0xA8 stores); both of those turned out to be other commands entirely, so
+the fake and the tests were replaced rather than ported.
 """
 
 from __future__ import annotations
 
 import json
-import tempfile
-from pathlib import Path
+
 from unittest.mock import patch
 
-from mooer_ge150_mcp.models.preset import Preset, PRESET_SIZE, OFF_TAIL
-from mooer_ge150_mcp.models.effects import (
-    AmpModule,
-    DistortionModule,
-    DelayModule,
-    ReverbModule,
-    NoiseGateModule,
-    MODULE_CLASSES,
-)
-from mooer_ge150_mcp.protocol.commands import build_read_preset, build_store_preset
-from mooer_ge150_mcp.protocol.parser import parse_preset_response
+import pytest
 
-from .fake_device import FakePedal, make_connection
+from mooer_ge150_mcp.protocol.commands import (
+    Command,
+    decode_module_block,
+    encode_module_block,
+)
+
+
+def _canonical(block):
+    """A module block as it looks after a wire round-trip (10 params)."""
+    return decode_module_block(encode_module_block(block))
+
+from .fake_max_pedal import FakeMaxPedal, make_max_connection
 from .test_restore_overwrite import _get_server_module
 
 
-def _make_rich_preset(name: str = "RW Test") -> Preset:
-    """A preset with distinct non-zero values spread across modules."""
-    return Preset(
-        name=name,
-        effect_order=[3, 1, 2, 0, 4, 5, 8, 7, 6, 0],
-        amp=AmpModule(enabled=1, type=12, amp_gain=200, bass=90, mid=110,
-                      treble=130, presence=70, master=150),
-        od=DistortionModule(enabled=1, type=4, volume=95, tone=85, gain=180),
-        ns=NoiseGateModule(enabled=1, threshold=42),
-        delay=DelayModule(enabled=1, type=2, level=60, feedback=45,
-                          time_ms=750, subdivision=3),
-        reverb=ReverbModule(enabled=1, type=5, level=80, decay=64, tone=33),
-    )
-
-
-# ─── Preset model: byte-level roundtrip ──────────────────────────────
-
-def test_preset_bytes_roundtrip():
-    """to_bytes → from_bytes must preserve every field."""
-    original = _make_rich_preset()
-    restored = Preset.from_bytes(original.to_bytes())
-    assert restored.to_bytes() == original.to_bytes()
-    assert restored.name == original.name
-    assert restored.effect_order == original.effect_order
-    assert restored.amp.amp_gain == 200
-    assert restored.delay.time_ms == 750
-    assert restored.delay.subdivision == 3
-
-
-def test_preset_serialized_size():
-    assert len(_make_rich_preset().to_bytes()) == PRESET_SIZE
-
-
-def _with_opaque_tail(preset: Preset) -> bytes:
-    """Serialize a preset, then fill the unmodeled tail with a pattern."""
-    raw = bytearray(preset.to_bytes())
-    raw[OFF_TAIL:PRESET_SIZE] = bytes(
-        (i * 7 + 13) & 0xFF for i in range(PRESET_SIZE - OFF_TAIL)
-    )
-    return bytes(raw)
-
-
-def test_preset_preserves_opaque_tail_bytes():
-    """Unmodeled bytes (0x9F-0x1FF) must survive from_bytes → to_bytes."""
-    raw = _with_opaque_tail(_make_rich_preset())
-    assert Preset.from_bytes(raw).to_bytes() == raw
-
-
-def test_delay_16bit_time_roundtrip():
-    """time_ms > 255 must survive serialization (16-bit little-endian)."""
-    delay = DelayModule(time_ms=1500)
-    restored = DelayModule.from_bytes(delay.to_bytes())
-    assert restored.time_ms == 1500
-
-
-def test_param_offsets_account_for_wide_fields():
-    """Delay params after the 16-bit time_ms must be shifted by one byte."""
-    offsets = DelayModule.param_offsets()
-    assert offsets["time_ms"] == 5
-    assert offsets["subdivision"] == 7  # not 6: time_ms occupies bytes 5-6
-    assert offsets["param5"] == 8
-
-
-def test_all_modules_to_dict_json_serializable():
-    """Tool results are JSON-encoded; no module dict may contain bytes."""
-    for name, cls in MODULE_CLASSES.items():
-        json.dumps(cls().to_dict())
-    json.dumps(_make_rich_preset().to_dict())
-
-
-# ─── Protocol + transport: chunked store and read ────────────────────
-
-def test_store_and_read_preset_via_transport():
-    """Full wire roundtrip: chunked store, then chunked read + reassembly."""
-    conn, pedal = make_connection()
-    original = _make_rich_preset("Wire Trip")
-
-    frames = build_store_preset(7, original.to_bytes())
-    assert len(frames) > 1  # 513-byte payload must be chunked
-    ack = conn.send_chunked_and_receive(frames)
-    assert ack is not None
-
-    response = conn.send_and_receive(build_read_preset(7))
-    assert response is not None
-    parsed = parse_preset_response(response)
-    assert parsed is not None
-    assert parsed.slot == 7
-
-    restored = Preset.from_bytes(parsed.data)
-    assert restored.to_bytes() == original.to_bytes()
-
-
-def test_read_response_spans_multiple_reports():
-    """A 512-byte preset response cannot fit one report; reassembly must work."""
-    conn, pedal = make_connection()
-    pedal.slots[3] = _make_rich_preset("Big Reply").to_bytes()
-
-    conn.write(build_read_preset(3))
-    assert len(pedal._tx_reports) > 1  # device queued a chunked response
-
-    frame = conn.read_message()
-    assert frame is not None
-    parsed = parse_preset_response(frame)
-    assert Preset.from_bytes(parsed.data).name == "Big Reply"
-
-
-def test_read_message_timeout_mid_message_returns_none():
-    """Losing reports mid-message must yield None, not a corrupt frame."""
-    conn, pedal = make_connection()
-    pedal.slots[0] = _make_rich_preset().to_bytes()
-    conn.write(build_read_preset(0))
-    # Drop everything after the first report
-    first = pedal._tx_reports.popleft()
-    pedal._tx_reports.clear()
-    pedal._tx_reports.append(first)
-    assert conn.read_message() is None
-
-
-# ─── Server tools: get/set/copy/swap/export/import/backup/restore ────
-
-def _server_with_pedal():
+@pytest.fixture
+def wired():
     server = _get_server_module()
-    conn, pedal = make_connection()
-    return server, conn, pedal
-
-
-def test_server_set_then_get_preset():
-    server, conn, pedal = _server_with_pedal()
+    conn, pedal = make_max_connection()
+    server._record_cache = {}
     with patch.object(server, "_get_connection", return_value=conn):
+        yield server, conn, pedal
+
+
+class TestSetGetRoundTrip:
+    def test_set_then_get_preset(self, wired):
+        server, _, _ = wired
         result = server.set_preset(
             5,
             name="Tone Five",
-            effects={"amp": {"type": 9, "amp_gain": 111},
-                     "delay": {"enabled": 1, "time_ms": 480}},
+            effects={
+                "amp": {"effect_type": 9, "params": [111, 50, 50]},
+                "delay": {"enabled": True, "params": [50, 50, 480]},
+            },
         )
-        assert result == {"stored": True, "slot": 5, "name": "Tone Five"}
+        assert result["stored"] is True
+        assert result["name"] == "Tone Five"
 
-    # get_preset now reads via the confirmed bulk dump, which this legacy
-    # fake does not implement, so verify the store landed on the device.
-    stored = Preset.from_bytes(pedal.slots[5])
-    assert stored.name == "Tone Five"
-    assert stored.amp.type == 9
-    assert stored.amp.amp_gain == 111
-    assert stored.delay.time_ms == 480
-    json.dumps(result)  # tool results must be JSON-serializable
+        read_back = server.get_preset(5)
+        assert read_back["name"] == "Tone Five"
+        assert read_back["modules"]["amp"]["effect_type"] == 9
+        assert read_back["modules"]["amp"]["params"][0] == 111
+        assert read_back["modules"]["delay"]["params"][2] == 480
+        json.dumps(read_back)  # tool results must be JSON-serializable
 
+    def test_name_only_update_preserves_effects(self, wired):
+        """A rename must not wipe the modules already in the slot."""
+        server, _, pedal = wired
+        before = _canonical(pedal.records[3].modules[Command.AMP])
 
-def test_server_set_preset_merges_over_existing():
-    """A name-only update must not wipe the effects already in the slot."""
-    server, conn, pedal = _server_with_pedal()
-    pedal.slots[2] = _make_rich_preset("Original").to_bytes()
-
-    with patch.object(server, "_get_connection", return_value=conn):
         server.set_preset(2, name="Renamed")
 
-    stored = Preset.from_bytes(pedal.slots[2])
-    assert stored.name == "Renamed"
-    assert stored.amp.amp_gain == 200  # preserved
+        stored = pedal.records[3]
+        assert stored.name == "Renamed"
+        assert stored.modules[Command.AMP] == before
+
+    def test_direct_writes_are_bracketed_like_a_restore(self, wired):
+        """0xC3 has only been observed inside 0xBA...0xBB, so every
+        direct write must use the same bracket."""
+        server, _, pedal = wired
+        server.set_preset(0, name="X")
+        assert pedal.restore_brackets == ["begin", "end"]
+
+    def test_legacy_param_names_are_rejected_with_guidance(self, wired):
+        """The old per-param names (amp_gain, ...) came from a speculative
+        model; the error should steer callers to the real schema."""
+        server, _, _ = wired
+        result = server.set_preset(0, effects={"amp": {"amp_gain": 100}})
+        assert "error" in result
+        assert "effect_type" in result["error"]
 
 
-def test_server_copy_and_swap_preserve_opaque_bytes():
-    """copy/swap must be byte-for-byte safe, including unmodeled data."""
-    server, conn, pedal = _server_with_pedal()
-    raw_a = _with_opaque_tail(_make_rich_preset("Opaque A"))
-    raw_b = _with_opaque_tail(_make_rich_preset("Opaque B"))
-    pedal.slots[0] = raw_a
-    pedal.slots[1] = raw_b
+class TestCopyAndSwap:
+    def test_copy_preserves_every_byte(self, wired):
+        """Unmodeled data — raw name padding and the 12-byte tail — must
+        survive a copy."""
+        server, _, pedal = wired
+        source = pedal.records[1]
+        source.tail = bytes(range(12))
+        source.name_raw = b"Padded  \x00\x00\x00\x00\x00\x00\x00\x00"
 
-    with patch.object(server, "_get_connection", return_value=conn):
-        server.copy_preset(0, 10)
-        assert pedal.slots[10] == raw_a
+        result = server.copy_preset(0, 9)
 
-        server.swap_presets(0, 1)
-        assert pedal.slots[0] == raw_b
-        assert pedal.slots[1] == raw_a
+        assert result["copied"] is True
+        target = pedal.records[10]
+        assert target.tail == bytes(range(12))
+        assert target.name_raw == source.name_raw
+        assert target.modules == {
+            c: _canonical(b) for c, b in source.modules.items()
+        }
+        assert target.slot == 10  # re-slotted, not cloned verbatim
 
+    def test_copy_does_not_alias_records(self, wired):
+        """Editing the copy afterwards must not change the source."""
+        server, _, pedal = wired
+        server.copy_preset(0, 9)
+        server.set_preset(9, effects={"amp": {"effect_type": 42}})
+        assert pedal.records[1].modules[Command.AMP].effect_type != 42
 
-def test_server_set_preset_merge_preserves_opaque_bytes():
-    """A partial set_preset must not zero the unmodeled tail bytes."""
-    server, conn, pedal = _server_with_pedal()
-    raw = _with_opaque_tail(_make_rich_preset("Opaque"))
-    pedal.slots[3] = raw
+    def test_swap_exchanges_slots_byte_exactly(self, wired):
+        server, _, pedal = wired
+        pedal.records[1].tail = b"A" * 12
+        pedal.records[8].tail = b"B" * 12
+        name_a, name_b = pedal.records[1].name, pedal.records[8].name
 
-    with patch.object(server, "_get_connection", return_value=conn):
-        server.set_preset(3, name="Renamed")
+        result = server.swap_presets(0, 7)
 
-    assert pedal.slots[3][OFF_TAIL:] == raw[OFF_TAIL:]
-    assert Preset.from_bytes(pedal.slots[3]).name == "Renamed"
-
-
-def test_server_copy_cache_entries_not_aliased():
-    """Partial updates to a copied slot must not bleed into the source."""
-    server, conn, pedal = _server_with_pedal()
-    pedal.slots[0] = _make_rich_preset("Tone A").to_bytes()
-
-    with patch.object(server, "_get_connection", return_value=conn):
-        server.copy_preset(0, 10)
-        assert server._preset_cache[0] is not server._preset_cache[10]
-
-        server.set_preset(10, name="Diverged")
-
-    assert server._preset_cache[0].name == "Tone A"
-    assert Preset.from_bytes(pedal.slots[0]).name == "Tone A"
-    assert Preset.from_bytes(pedal.slots[10]).name == "Diverged"
+        assert result["swapped"] is True
+        assert pedal.records[1].name == name_b
+        assert pedal.records[8].name == name_a
+        assert pedal.records[1].tail == b"B" * 12
+        assert pedal.records[8].tail == b"A" * 12
 
 
-def test_server_copy_and_swap_presets():
-    server, conn, pedal = _server_with_pedal()
-    pedal.slots[0] = _make_rich_preset("Tone A").to_bytes()
-    pedal.slots[1] = _make_rich_preset("Tone B").to_bytes()
+class TestExportImport:
+    def test_export_import_round_trip(self, wired, tmp_path):
+        server, _, pedal = wired
+        pedal.records[1].tail = bytes(range(12))
+        path = tmp_path / "one.json"
 
-    with patch.object(server, "_get_connection", return_value=conn):
-        copied = server.copy_preset(0, 10)
-        assert copied["copied"] and copied["name"] == "Tone A"
-        assert Preset.from_bytes(pedal.slots[10]).name == "Tone A"
+        exported = server.export_preset(0, str(path))
+        assert exported["name"] == "Preset 1"
 
-        server.swap_presets(0, 1)
-        assert Preset.from_bytes(pedal.slots[0]).name == "Tone B"
-        assert Preset.from_bytes(pedal.slots[1]).name == "Tone A"
-        # Cache must track the swap so later merges don't use stale data
-        assert server._preset_cache[0].name == "Tone B"
-        assert server._preset_cache[1].name == "Tone A"
+        result = server.import_preset(str(path), 19)
+        assert result["imported"] is True
+        assert result["address"] == "5D"
+        assert pedal.records[20].name == "Preset 1"
+        assert pedal.records[20].tail == bytes(range(12))
+        assert pedal.records[20].slot == 20  # re-slotted on import
 
+    def test_import_rejects_foreign_files(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "bogus.json"
+        path.write_text('{"format": "something-else"}')
+        assert "error" in server.import_preset(str(path), 0)
 
-def test_server_export_import_mo_roundtrip(tmp_path):
-    server, conn, pedal = _server_with_pedal()
-    pedal.slots[4] = _make_rich_preset("File Trip").to_bytes()
-    mo_path = tmp_path / "preset.mo"
-
-    with patch.object(server, "_get_connection", return_value=conn):
-        exported = server.export_preset(4, str(mo_path))
-        assert exported["name"] == "File Trip"
-
-        imported = server.import_preset(str(mo_path), 20)
-        assert imported == {"imported": True, "slot": 20, "name": "File Trip"}
-
-    assert pedal.slots[20] == pedal.slots[4]
+    def test_import_rejects_truncated_records(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "short.json"
+        path.write_text(json.dumps(
+            {"format": "mooer-ge150-preset", "slot": 0, "record": "aa55"}
+        ))
+        assert "error" in server.import_preset(str(path), 0)
 
 
-def test_server_backup_restore_roundtrip(tmp_path):
-    """backup_all → wipe device → restore_backup must restore every patch."""
-    server, conn, pedal = _server_with_pedal()
-    pedal.slots[0] = _make_rich_preset("Keep Me 0").to_bytes()
-    pedal.slots[42] = _make_rich_preset("Keep Me 42").to_bytes()
-    original_slots = list(pedal.slots)
-    mbf_path = tmp_path / "backup.mbf"
+class TestBackupRestore:
+    def test_backup_restore_round_trip(self, wired, tmp_path):
+        server, _, pedal = wired
+        pedal.records[7].tail = b"\x07" * 12
+        path = tmp_path / "backup.json"
 
-    with patch.object(server, "_get_connection", return_value=conn), \
-         patch("mooer_ge150_mcp.transport.usb_connection.time.sleep"):
-        backed_up = server.backup_all(str(mbf_path))
-        assert backed_up["preset_count"] == 199
-        assert "failed_slots" not in backed_up
+        result = server.backup_all(str(path))
+        assert result["preset_count"] == 200
 
-        # Wipe the device, then restore
-        pedal.slots = [bytes(PRESET_SIZE) for _ in pedal.slots]
-        restored = server.restore_backup(str(mbf_path), overwrite=True)
-        assert restored["restored"]
+        # Wreck a preset, then restore over it.
+        server.set_preset(6, name="Wrecked",
+                          effects={"amp": {"effect_type": 63}})
+        restored = server.restore_backup(str(path), overwrite=True)
 
-    assert Preset.from_bytes(pedal.slots[0]).name == "Keep Me 0"
-    assert Preset.from_bytes(pedal.slots[42]).name == "Keep Me 42"
-    # Every backed-up slot must match the original device state.
-    # Compare canonical Preset form: a restored empty slot carries the
-    # serialized size field, which raw all-zero flash bytes lack.
-    for slot in range(199):
-        restored_bytes = Preset.from_bytes(pedal.slots[slot]).to_bytes()
-        original_bytes = Preset.from_bytes(original_slots[slot]).to_bytes()
-        assert restored_bytes == original_bytes, f"slot {slot} differs"
+        assert restored["restored"] is True
+        assert pedal.records[7].name == "Preset 7"
+        assert pedal.records[7].tail == b"\x07" * 12
 
+    def test_backup_file_is_json_with_hex_records(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "backup.json"
+        server.backup_all(str(path))
 
-# Two tests once lived here pinning set_effect_param's byte-offset delta
-# protocol (one frame per byte, param addressed by name). Both USB captures
-# disprove it: MOOER Studio never sends a parameter delta, it resends the
-# module's whole 24-byte block. The tool was rewired accordingly and is
-# covered by tests/test_tools_rewired.py::TestEffectEditing.
+        payload = json.loads(path.read_text())
+        assert payload["format"] == "mooer-ge150-backup"
+        assert len(payload["presets"]) == 200
+        first = payload["presets"][0]
+        assert first["address"] == "1A"
+        assert len(bytes.fromhex(first["record"])) == 245

@@ -15,7 +15,7 @@ Request              Response
 ``0xC1`` IR LIST     ``0x41``, 40 x 16-byte names
 ``0xB0`` ACTIVE      ``0x30``, active preset state
 ``0x82``-``0x8A``    echoes the block back as ``0x02``-``0x0A``
-``0x97`` SET NAME    ``0x17`` notification
+``0x97`` SAVE        ``0x17`` notification
 ===================  ==========================================
 """
 
@@ -83,6 +83,7 @@ class FakeMaxPedal:
         self.selected: list[int] = []
         self.saves: list[tuple[int, bytes]] = []
         self.uploaded: list[int] = []
+        self.restore_brackets: list[str] = []
         self.settings: dict[Command, list[int]] = {}
         self.ctrl_flags: list[list[bool]] = [
             [False] * len(MODULE_CHAIN) for _ in range(NUM_SLOTS)
@@ -184,6 +185,12 @@ class FakeMaxPedal:
                 )
                 self.saves.append((slot, name))
             self._respond(Command.PRESET_NAME_NOTIFY, payload)
+
+        elif command == Command.RESTORE_BEGIN:
+            self.restore_brackets.append("begin")
+
+        elif command == Command.RESTORE_END:
+            self.restore_brackets.append("end")
 
         elif command == Command.WRITE_PRESET:
             from mooer_ge150_mcp.protocol.commands import decode_preset_record

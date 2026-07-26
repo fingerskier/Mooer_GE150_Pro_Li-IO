@@ -115,12 +115,14 @@ class Command(IntEnum):
     SETTING_AC = 0xAC  # confirmed: 9-byte struct
     POLL = 0xB4  # confirmed: u16 selector, acked by 0x34
 
-    # --- not observed in either capture ----------------------------------
+    # --- never observed in any capture: documentation only ----------------
+    # No builder exists for these and no tool sends them. A guessed
+    # command can collide with a real one (0xA5 turned out to be screen
+    # brightness; 0xA8 a real setting), so unverified IDs stay inert.
     IDENTIFY = 0x10  # unverified
     SYSTEM = 0xA1  # unverified
     VOLUME = 0xA2  # unverified
     PEDAL_ASSIGNMENT = 0xA3  # unverified
-    STORE_PATCH = 0xA8  # unverified
     CABINET_UPLOAD = 0xE1  # unverified
     AMP_UPLOAD = 0xE2  # unverified
     AMP_MODELS = 0xE3  # unverified
@@ -399,23 +401,6 @@ def encode_preset_record(record: PresetRecord) -> bytes:
     return out + record.tail
 
 
-def build_read_preset(slot: int) -> bytes:
-    """Build a preset read request.
-
-    Takes a 0-199 slot to match the rest of the server, even though the
-    pedal numbers its slots 1-200 on the wire (see
-    :data:`FIRST_PRESET_SLOT`). Migrating the server to the device's
-    numbering is tracked separately; doing it here alone would leave the
-    two halves inconsistent.
-
-    Args:
-        slot: Preset slot 0-199.
-    """
-    if not 0 <= slot <= 199:
-        raise ValueError(f"Preset slot must be 0-199, got {slot}")
-    return build_command(Command.READ_PRESET, bytes([slot]))
-
-
 def build_select_preset_slot(slot: int) -> bytes:
     """Build a preset-select command for a 1-based slot.
 
@@ -573,24 +558,6 @@ def _check_slot(slot: int) -> None:
         )
 
 
-def build_set_preset_name(slot: int, name: str) -> bytes:
-    """Build a command that names a preset slot.
-
-    The pedal sends the same shape as 0x17 when a preset is renamed from
-    the hardware.
-
-    Args:
-        slot: Preset slot 0-199, matching the rest of the server.
-        name: Preset name; ASCII, truncated to 16 bytes and zero-padded.
-    """
-    if not 0 <= slot <= 199:
-        raise ValueError(f"Preset slot must be 0-199, got {slot}")
-
-    encoded = name.encode("ascii", errors="replace")[:PRESET_NAME_LENGTH]
-    padded = encoded.ljust(PRESET_NAME_LENGTH, b"\x00")
-    return build_command(Command.PRESET_NAME, bytes([slot]) + padded)
-
-
 def build_poll(selector: int) -> bytes:
     """Build a status poll. The device acknowledges with command 0x34.
 
@@ -600,114 +567,6 @@ def build_poll(selector: int) -> bytes:
     if not 0 <= selector <= 0xFFFF:
         raise ValueError(f"Poll selector must be 0-65535, got {selector}")
     return build_command(Command.POLL, selector.to_bytes(2, "little"))
-
-
-# ---------------------------------------------------------------------------
-# Unverified: retained from the pre-capture GE150 protocol notes
-# ---------------------------------------------------------------------------
-
-
-def build_identify() -> bytes:
-    """Build an Identify command (0x10) to handshake with the device.
-
-    Unverified -- no identify exchange appears in the capture.
-    """
-    return build_command(Command.IDENTIFY)
-
-
-def build_select_preset(slot: int) -> bytes:
-    """Build a command to switch the active preset.
-
-    Unverified. The capture shows 0xA6 carrying two u16 flags rather than
-    a slot index, so the pre-capture assumption does not hold; this now
-    uses the confirmed preset-read ID as the closest available stand-in.
-    """
-    if not 0 <= slot <= 199:
-        raise ValueError(f"Preset slot must be 0-199, got {slot}")
-    return build_command(Command.READ_PRESET, bytes([slot]))
-
-
-def build_store_preset(slot: int, preset_data: bytes) -> list[bytes]:
-    """Build StorePatch command(s) to write preset data to a slot.
-
-    Unverified -- neither capture contains a preset write, so the command
-    ID is still a guess. The 63-byte chunking it relies on *is* now
-    confirmed (the pedal uses it for the 0x20 preset dump).
-
-    Note the mismatch with what the pedal actually stores: a real preset
-    record is 245 bytes and slots are numbered 1-200, whereas this takes
-    512 bytes and 0-199. Reconciling that means re-indexing the server's
-    slot model, which is deliberately left as separate work.
-
-    Args:
-        slot: Target preset slot 0-199.
-        preset_data: The serialized 0x200-byte preset structure.
-    """
-    if not 0 <= slot <= 199:
-        raise ValueError(f"Preset slot must be 0-199, got {slot}")
-    if len(preset_data) != 0x200:
-        raise ValueError(
-            f"Preset data must be 512 bytes, got {len(preset_data)}"
-        )
-    payload = bytes([slot]) + preset_data
-    return build_chunked_frames(Command.STORE_PATCH.value, payload)
-
-
-def build_effect_param(module: str, param_index: int, value: int) -> bytes:
-    """Build a command to set a single effect parameter.
-
-    Unverified. MOOER Studio never sends single-parameter deltas -- it
-    resends the whole module block. Prefer :func:`build_module_block`.
-
-    Args:
-        module: Effect module name (see :data:`MODULE_COMMAND_MAP`).
-        param_index: Parameter byte index within the module.
-        value: Parameter value (0-255).
-    """
-    if not 0 <= value <= 255:
-        raise ValueError(f"Parameter value must be 0-255, got {value}")
-    return build_command(_module_command(module), bytes([param_index, value]))
-
-
-def build_toggle_effect(module: str, enabled: bool) -> bytes:
-    """Build a command to enable or disable an effect module.
-
-    Unverified in this form. In the capture the enable flag is word 0 of
-    the full module block, so toggling requires the module's current
-    state; use :func:`build_module_block` when that state is known.
-    """
-    return build_effect_param(module, 1, 1 if enabled else 0)
-
-
-def build_set_volume(volume: int) -> bytes:
-    """Build a Volume command. Unverified.
-
-    Args:
-        volume: Volume level 0-100.
-    """
-    if not 0 <= volume <= 100:
-        raise ValueError(f"Volume must be 0-100, got {volume}")
-    return build_command(Command.VOLUME, bytes([volume]))
-
-
-def build_get_volume() -> bytes:
-    """Build a Volume read command. Unverified."""
-    return build_command(Command.VOLUME)
-
-
-def build_get_system_settings() -> bytes:
-    """Build a System settings read command. Unverified."""
-    return build_command(Command.SYSTEM)
-
-
-def build_set_system_setting(setting_index: int, value: int) -> bytes:
-    """Build a command to modify a system setting. Unverified.
-
-    Args:
-        setting_index: Setting byte offset.
-        value: Setting value.
-    """
-    return build_command(Command.SYSTEM, bytes([setting_index, value]))
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,7 @@ from mooer_ge150_mcp.protocol.commands import (
     build_hello,
     build_read_active_preset,
     build_read_ir_list,
-    build_set_preset_name,
+    build_save_preset,
     decode_preset_record,
     encode_preset_record,
     response_command,
@@ -206,8 +206,9 @@ class TestPedalOriginatedNotifications:
         assert payload[0] == 0xC1
         assert payload[1:].decode("ascii").rstrip() == "Asatooo1"
 
-    def test_set_name_builder_matches_the_notification_shape(self):
-        frame = parse_frame(build_set_preset_name(193, "Asatooo1"))
+    def test_save_builder_matches_the_notification_shape(self):
+        """Wire slot 0xC1 = 193 (1-based) = 49A, the renamed preset."""
+        frame = parse_frame(build_save_preset(193, "Asatooo1"))
         assert frame is not None
         assert frame.command == Command.PRESET_NAME
         assert frame.payload[0] == 193

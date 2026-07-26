@@ -1,28 +1,23 @@
-"""Tests for restore_backup overwrite guard logic."""
+"""Overwrite guards on restore_backup.
+
+The contracts from commit bcf8938, re-pinned against the confirmed
+protocol: an occupied slot is never clobbered by an empty backup entry,
+``overwrite=False`` skips occupied slots entirely, and empty device
+slots are always filled.
+"""
 
 from __future__ import annotations
 
+import json
 import sys
-import tempfile
+
 from unittest.mock import MagicMock, patch
 
-from mooer_ge150_mcp.models.preset import Preset
-from mooer_ge150_mcp.models.file_formats import export_mbf
-from mooer_ge150_mcp.protocol.commands import Command
-from mooer_ge150_mcp.protocol.framing import Frame
+import pytest
 
+from mooer_ge150_mcp.protocol.commands import PRESET_NAME_LENGTH
 
-def _make_preset_frame(slot: int, preset: Preset) -> Frame:
-    """Build a Frame that parse_preset_response can parse."""
-    return Frame(command=Command.READ_PRESET, payload=bytes([slot]) + preset.to_bytes())
-
-
-def _create_backup(presets: list[Preset]) -> str:
-    """Export presets to a temporary .mbf file and return the path."""
-    f = tempfile.NamedTemporaryFile(suffix=".mbf", delete=False)
-    path = export_mbf(presets, f.name)
-    f.close()
-    return path
+from .fake_max_pedal import make_max_connection
 
 
 def _get_server_module():
@@ -44,85 +39,87 @@ def _get_server_module():
     return server_mod
 
 
-def test_empty_backup_preset_does_not_erase_occupied_slot():
-    """An empty backup entry must NOT overwrite a named device preset
-    when overwrite=False."""
+@pytest.fixture
+def wired():
     server = _get_server_module()
-
-    # Device has a named preset in slot 0
-    device_preset = Preset(name="My Tone")
-    device_frame = _make_preset_frame(0, device_preset)
-
-    # Backup has an empty preset in slot 0
-    backup_presets = [Preset()]  # empty name
-    backup_path = _create_backup(backup_presets)
-
-    mock_conn = MagicMock()
-    mock_conn.send_and_receive.return_value = device_frame
-
-    with patch.object(server, "_get_connection", return_value=mock_conn):
-        result = server.restore_backup(backup_path, overwrite=False)
-
-    # The occupied slot should have been skipped
-    assert result["preset_count"] == 0
-    mock_conn.send_chunked_and_receive.assert_not_called()
+    conn, pedal = make_max_connection()
+    server._record_cache = {}
+    with patch.object(server, "_get_connection", return_value=conn):
+        yield server, conn, pedal
 
 
-def test_empty_backup_preset_can_overwrite_when_flag_set():
-    """When overwrite=True, even empty backup presets should be written."""
-    server = _get_server_module()
-
-    backup_presets = [Preset()]  # empty name
-    backup_path = _create_backup(backup_presets)
-
-    mock_conn = MagicMock()
-
-    with patch.object(server, "_get_connection", return_value=mock_conn):
-        result = server.restore_backup(backup_path, overwrite=True)
-
-    # mbf format pads to 199 entries; all should be written with overwrite=True
-    assert result["preset_count"] == 199
-    assert mock_conn.send_chunked_and_receive.call_count == 199
+def _make_backup(server, pedal, path, edits):
+    """Write a backup file, apply *edits* to the entries, return path."""
+    server.backup_all(str(path))
+    payload = json.loads(path.read_text())
+    for slot, entry_edit in edits.items():
+        for entry in payload["presets"]:
+            if entry["slot"] == slot:
+                entry.update(entry_edit)
+    path.write_text(json.dumps(payload))
+    return path
 
 
-def test_named_backup_skips_occupied_slot():
-    """A named backup preset should not overwrite a named device preset
-    when overwrite=False."""
-    server = _get_server_module()
-
-    device_preset = Preset(name="User Preset")
-    device_frame = _make_preset_frame(0, device_preset)
-
-    backup_presets = [Preset(name="Backup Tone")]
-    backup_path = _create_backup(backup_presets)
-
-    mock_conn = MagicMock()
-    mock_conn.send_and_receive.return_value = device_frame
-
-    with patch.object(server, "_get_connection", return_value=mock_conn):
-        result = server.restore_backup(backup_path, overwrite=False)
-
-    assert result["preset_count"] == 0
-    mock_conn.send_chunked_and_receive.assert_not_called()
+def _blank_entry(entry_record_hex: str) -> dict:
+    """Blank out the name inside a raw record, keeping everything else."""
+    raw = bytearray(bytes.fromhex(entry_record_hex))
+    raw[1 : 1 + PRESET_NAME_LENGTH] = bytes(PRESET_NAME_LENGTH)
+    return {"name": "", "record": raw.hex()}
 
 
-def test_backup_fills_empty_device_slot():
-    """A named backup preset should be written to an empty device slot
-    when overwrite=False."""
-    server = _get_server_module()
+def test_empty_backup_preset_does_not_erase_occupied_slot(wired, tmp_path):
+    """An empty backup entry must NOT overwrite a named device preset,
+    even with overwrite=True."""
+    server, _, pedal = wired
+    path = tmp_path / "backup.json"
+    server.backup_all(str(path))
 
-    device_preset = Preset()  # empty slot on device
-    device_frame = _make_preset_frame(0, device_preset)
+    payload = json.loads(path.read_text())
+    payload["presets"][0].update(_blank_entry(payload["presets"][0]["record"]))
+    path.write_text(json.dumps(payload))
 
-    backup_presets = [Preset(name="New Tone")]
-    backup_path = _create_backup(backup_presets)
+    result = server.restore_backup(str(path), overwrite=True)
 
-    mock_conn = MagicMock()
-    mock_conn.send_and_receive.return_value = device_frame
+    assert pedal.records[1].name == "Preset 1"  # survived
+    assert 0 in result.get("skipped_slots", [])
 
-    with patch.object(server, "_get_connection", return_value=mock_conn):
-        result = server.restore_backup(backup_path, overwrite=False)
 
-    # All 199 slots are empty on the device, so all 199 entries get written
-    assert result["preset_count"] == 199
-    assert mock_conn.send_chunked_and_receive.call_count == 199
+def test_named_backup_skips_occupied_slot(wired, tmp_path):
+    """With overwrite=False, a named backup entry must not replace a
+    named device preset."""
+    server, _, pedal = wired
+    path = tmp_path / "backup.json"
+    server.backup_all(str(path))
+
+    # Change the device preset after the backup was taken.
+    server.set_preset(0, name="Kept On Device")
+
+    result = server.restore_backup(str(path), overwrite=False)
+
+    assert pedal.records[1].name == "Kept On Device"
+    assert 0 in result.get("skipped_slots", [])
+
+
+def test_backup_fills_empty_device_slot(wired, tmp_path):
+    """An empty device slot is filled from the backup even without
+    overwrite."""
+    server, _, pedal = wired
+    path = tmp_path / "backup.json"
+    server.backup_all(str(path))
+
+    # Empty the device slot after the backup.
+    server.set_preset(0, name="")
+    server._record_cache = {}
+    assert not pedal.records[1].name.strip()
+
+    result = server.restore_backup(str(path), overwrite=False)
+
+    assert pedal.records[1].name == "Preset 1"  # refilled from backup
+    assert result["preset_count"] >= 1
+
+
+def test_restore_rejects_unknown_format(wired, tmp_path):
+    server, _, _ = wired
+    path = tmp_path / "old.mbf"
+    path.write_bytes(b"\x00" * 64)
+    assert "error" in server.restore_backup(str(path))

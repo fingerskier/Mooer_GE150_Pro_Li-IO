@@ -1,158 +1,95 @@
-"""Tests for command builders."""
+"""Tests for the surviving command builders.
+
+The pre-capture builders (identify, store-patch, byte-delta effect
+params, volume, system settings) were deleted rather than kept: several
+of their guessed command IDs turned out to collide with real commands
+(0xA5 is screen brightness, 0xA8 a real setting), so an unverified
+builder is a hazard, not a convenience. What remains here is only what
+the captures back.
+"""
 
 import pytest
 
 from mooer_ge150_mcp.protocol.commands import (
     Command,
-    build_command,
-    build_identify,
-    build_select_preset,
-    build_read_preset,
-    build_store_preset,
-    build_effect_param,
-    build_toggle_effect,
-    build_set_volume,
-    build_get_volume,
+    build_save_preset,
+    build_select_preset_slot,
+    build_set_cab_sim_thru,
+    build_set_input_level,
+    build_set_spillover,
+    build_write_ctrl_config,
+    db_to_level,
+    level_to_db,
 )
 from mooer_ge150_mcp.protocol.framing import parse_frame, HID_REPORT_SIZE
 
 
 def test_command_enum_values():
-    """Verify key command IDs match the USB capture.
-
-    The effect-module and preset IDs come from ``log/various_tests.pcapng``;
-    IDENTIFY/VOLUME/SYSTEM/STORE_PATCH never appeared there and remain
-    provisional.
-    """
+    """Key command IDs, as confirmed across the six captures."""
     assert Command.FX == 0x82
     assert Command.AMP == 0x84
     assert Command.CAB == 0x85
     assert Command.DELAY == 0x89
     assert Command.REVERB == 0x8A
-    assert Command.READ_PRESET == 0x96
-    assert Command.PRESET_NAME == 0x97
+    assert Command.SELECT_PRESET == 0x96
+    assert Command.SAVE_PRESET == 0x97
+    assert Command.WRITE_PRESET == 0xC3
+    assert Command.INPUT_LEVEL == 0xA4
+    assert Command.SCREEN_BRIGHTNESS == 0xA5
     assert Command.CAB_SIM_THRU == 0xA6
     assert Command.POLL == 0xB4
 
+    # Never observed; retained as documentation only, with no builders.
     assert Command.IDENTIFY == 0x10
-    assert Command.STORE_PATCH == 0xA8
     assert Command.VOLUME == 0xA2
     assert Command.SYSTEM == 0xA1
 
 
-def test_build_identify():
-    """Identify command should be a valid 64-byte frame."""
-    frame = build_identify()
-    assert len(frame) == HID_REPORT_SIZE
-    parsed = parse_frame(frame)
-    assert parsed is not None
-    assert parsed.command == Command.IDENTIFY
+def test_no_store_patch_alias():
+    """0xA8 is a real setting; the old STORE_PATCH alias invited misuse."""
+    assert not hasattr(Command, "STORE_PATCH")
 
 
-def test_build_select_preset():
-    """Select preset should embed the slot index.
+def test_build_select_preset_slot_is_one_based():
+    frame = parse_frame(build_select_preset_slot(200))
+    assert frame is not None
+    assert frame.command == Command.SELECT_PRESET
+    assert frame.payload == bytes([200])
 
-    0xA6 carries two u16 flags in the capture, not a slot index, so this
-    now rides on the confirmed preset-read ID until a real preset-select
-    exchange is captured.
-    """
-    frame = build_select_preset(42)
-    parsed = parse_frame(frame)
-    assert parsed is not None
-    assert parsed.command == Command.READ_PRESET
-    assert parsed.payload == bytes([42])
-
-
-def test_select_preset_bounds():
-    """Selecting out-of-range slot should raise."""
     with pytest.raises(ValueError):
-        build_select_preset(200)
+        build_select_preset_slot(0)
     with pytest.raises(ValueError):
-        build_select_preset(-1)
+        build_select_preset_slot(201)
 
 
-def test_build_read_preset():
-    """Read preset command should contain the slot index."""
-    frame = build_read_preset(0)
-    parsed = parse_frame(frame)
-    assert parsed is not None
-    assert parsed.command == Command.READ_PRESET
-    assert parsed.payload == bytes([0])
+def test_build_save_preset_carries_slot_and_padded_name():
+    frame = parse_frame(build_save_preset(200, "Dual Lead"))
+    assert frame is not None
+    assert frame.command == Command.SAVE_PRESET
+    assert frame.payload[0] == 200
+    assert frame.payload[1:] == b"Dual Lead".ljust(16, b"\x00")
 
 
-def test_build_store_preset():
-    """Store preset should produce chunked frames for 512-byte data."""
-    preset_data = b"\x00" * 0x200
-    frames = build_store_preset(5, preset_data)
-    assert isinstance(frames, list)
-    assert len(frames) > 0
-    for f in frames:
-        assert len(f) == HID_REPORT_SIZE
+def test_level_encoding_matches_both_observed_points():
+    """2.5 dB -> 14 (input level) and 1.0 dB -> 11 (OTG level)."""
+    assert db_to_level(2.5) == 14
+    assert db_to_level(1.0) == 11
+    assert db_to_level(0.0) == 9
+    assert level_to_db(14) == 2.5
+    assert level_to_db(9) == 0.0
 
 
-def test_store_preset_wrong_size():
-    """Store preset with wrong data size should raise."""
+def test_settings_builders_produce_valid_frames():
+    for report in (
+        build_set_input_level(14),
+        build_set_cab_sim_thru(True, False),
+        build_set_spillover(True),
+        build_write_ctrl_config(0, [True] + [False] * 8),
+    ):
+        assert len(report) == HID_REPORT_SIZE
+        assert parse_frame(report) is not None
+
+
+def test_ctrl_config_needs_exactly_nine_flags():
     with pytest.raises(ValueError):
-        build_store_preset(0, b"\x00" * 100)
-
-
-def test_build_effect_param():
-    """Effect param command should use the correct module command ID."""
-    frame = build_effect_param("amp", 3, 128)
-    parsed = parse_frame(frame)
-    assert parsed is not None
-    assert parsed.command == Command.AMP
-    assert parsed.payload == bytes([3, 128])
-
-
-def test_effect_param_invalid_module():
-    """Unknown module should raise."""
-    with pytest.raises(ValueError):
-        build_effect_param("unknown", 0, 0)
-
-
-def test_effect_param_invalid_value():
-    """Value out of 0-255 should raise."""
-    with pytest.raises(ValueError):
-        build_effect_param("amp", 0, 256)
-
-
-def test_build_toggle_effect():
-    """Toggle should set param index 1 to 0 or 1."""
-    on_frame = build_toggle_effect("amp", True)
-    off_frame = build_toggle_effect("amp", False)
-
-    on_parsed = parse_frame(on_frame)
-    off_parsed = parse_frame(off_frame)
-
-    assert on_parsed is not None
-    assert on_parsed.payload == bytes([1, 1])
-
-    assert off_parsed is not None
-    assert off_parsed.payload == bytes([1, 0])
-
-
-def test_build_set_volume():
-    """Volume command should contain the volume level."""
-    frame = build_set_volume(75)
-    parsed = parse_frame(frame)
-    assert parsed is not None
-    assert parsed.command == Command.VOLUME
-    assert parsed.payload == bytes([75])
-
-
-def test_volume_bounds():
-    """Volume out of 0-100 should raise."""
-    with pytest.raises(ValueError):
-        build_set_volume(101)
-    with pytest.raises(ValueError):
-        build_set_volume(-1)
-
-
-def test_build_get_volume():
-    """Get volume command should have no payload."""
-    frame = build_get_volume()
-    parsed = parse_frame(frame)
-    assert parsed is not None
-    assert parsed.command == Command.VOLUME
-    assert parsed.payload == b""
+        build_write_ctrl_config(0, [True] * 8)
