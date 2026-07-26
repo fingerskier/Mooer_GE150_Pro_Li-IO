@@ -394,6 +394,56 @@ def build_read_ir_list() -> bytes:
     return build_command(Command.READ_IR_LIST, b"\x01")
 
 
+#: The IR list reply holds this many fixed-width name fields.
+IR_SLOT_COUNT = 40
+#: An unused IR slot reads back as this literal.
+IR_EMPTY_NAME = "EMPTY"
+
+
+def decode_ir_list(payload: bytes) -> list[str]:
+    """Parse an IR_LIST (0x41) payload into slot names.
+
+    Unused slots come back as ``"EMPTY"``; the name is returned as-is so
+    callers can decide what counts as empty.
+    """
+    expected = IR_SLOT_COUNT * PRESET_NAME_LENGTH
+    if len(payload) != expected:
+        raise ValueError(
+            f"IR list must be {expected} bytes, got {len(payload)}"
+        )
+
+    names = []
+    for i in range(IR_SLOT_COUNT):
+        field = payload[i * PRESET_NAME_LENGTH : (i + 1) * PRESET_NAME_LENGTH]
+        text = field.split(b"\x00")[0].decode("ascii", errors="replace").rstrip()
+        names.append(text)
+    return names
+
+
+def decode_active_state(payload: bytes) -> PresetRecord:
+    """Parse an ACTIVE_STATE (0x30) payload.
+
+    Same shape as a preset record but with a slot byte and one flag byte
+    where the 16-byte name would be, so the returned record has an empty
+    name field.
+    """
+    expected = PRESET_RECORD_SIZE - PRESET_NAME_LENGTH + 1
+    if len(payload) != expected:
+        raise ValueError(
+            f"Active state must be {expected} bytes, got {len(payload)}"
+        )
+
+    modules: dict[Command, ModuleBlock] = {}
+    offset = 2
+    for command in MODULE_CHAIN:
+        modules[command] = decode_module_block(
+            payload[offset : offset + MODULE_BLOCK_SIZE]
+        )
+        offset += MODULE_BLOCK_SIZE
+
+    return PresetRecord(slot=payload[0], modules=modules, tail=payload[offset:])
+
+
 def build_read_active_preset() -> bytes:
     """Request the currently active preset's state. Replies 0x30.
 

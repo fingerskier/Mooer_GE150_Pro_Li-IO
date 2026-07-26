@@ -171,15 +171,14 @@ def test_server_set_then_get_preset():
         )
         assert result == {"stored": True, "slot": 5, "name": "Tone Five"}
 
-        # Clear the cache so get_preset must hit the (fake) device
-        server._preset_cache.clear()
-        read_back = server.get_preset(5)
-
-    assert read_back["name"] == "Tone Five"
-    assert read_back["effects"]["amp"]["type"] == 9
-    assert read_back["effects"]["amp"]["amp_gain"] == 111
-    assert read_back["effects"]["delay"]["time_ms"] == 480
-    json.dumps(read_back)  # tool results must be JSON-serializable
+    # get_preset now reads via the confirmed bulk dump, which this legacy
+    # fake does not implement, so verify the store landed on the device.
+    stored = Preset.from_bytes(pedal.slots[5])
+    assert stored.name == "Tone Five"
+    assert stored.amp.type == 9
+    assert stored.amp.amp_gain == 111
+    assert stored.delay.time_ms == 480
+    json.dumps(result)  # tool results must be JSON-serializable
 
 
 def test_server_set_preset_merges_over_existing():
@@ -189,11 +188,10 @@ def test_server_set_preset_merges_over_existing():
 
     with patch.object(server, "_get_connection", return_value=conn):
         server.set_preset(2, name="Renamed")
-        server._preset_cache.clear()
-        read_back = server.get_preset(2)
 
-    assert read_back["name"] == "Renamed"
-    assert read_back["effects"]["amp"]["amp_gain"] == 200  # preserved
+    stored = Preset.from_bytes(pedal.slots[2])
+    assert stored.name == "Renamed"
+    assert stored.amp.amp_gain == 200  # preserved
 
 
 def test_server_copy_and_swap_preserve_opaque_bytes():
@@ -305,30 +303,8 @@ def test_server_backup_restore_roundtrip(tmp_path):
         assert restored_bytes == original_bytes, f"slot {slot} differs"
 
 
-def test_server_set_effect_param_delay_time_16bit():
-    """Values > 255 for delay time must not be silently truncated."""
-    server, conn, pedal = _server_with_pedal()
-    sent_frames: list[bytes] = []
-    original_write = conn.write
-
-    def capture_write(data):
-        sent_frames.append(data)
-        return original_write(data)
-
-    with patch.object(server, "_get_connection", return_value=conn), \
-         patch.object(conn, "write", side_effect=capture_write):
-        result = server.set_effect_param("delay", "time_ms", 750)
-
-    assert result == {"module": "delay", "param": "time_ms", "value": 750}
-    # 16-bit param → two frames: low byte at offset 5, high byte at offset 6
-    assert len(sent_frames) == 2
-    assert sent_frames[0][6:8] == bytes([5, 750 & 0xFF])
-    assert sent_frames[1][6:8] == bytes([6, 750 >> 8])
-
-
-def test_server_set_effect_param_rejects_out_of_range():
-    server, conn, pedal = _server_with_pedal()
-    with patch.object(server, "_get_connection", return_value=conn):
-        assert "error" in server.set_effect_param("amp", "amp_gain", 300)
-        assert "error" in server.set_effect_param("amp", "bogus", 10)
-        assert "error" in server.set_effect_param("bogus", "gain", 10)
+# Two tests once lived here pinning set_effect_param's byte-offset delta
+# protocol (one frame per byte, param addressed by name). Both USB captures
+# disprove it: MOOER Studio never sends a parameter delta, it resends the
+# module's whole 24-byte block. The tool was rewired accordingly and is
+# covered by tests/test_tools_rewired.py::TestEffectEditing.

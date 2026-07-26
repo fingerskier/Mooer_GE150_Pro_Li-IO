@@ -291,6 +291,40 @@ class USBConnection:
         self.write(data)
         return self.read_message(timeout_ms)
 
+    def send_and_collect(
+        self,
+        data: bytes,
+        count: int,
+        timeout_ms: int = READ_TIMEOUT_MS,
+    ) -> list[Frame]:
+        """Send a command and collect up to *count* reply messages.
+
+        Some requests answer with a stream rather than a single message --
+        ``DUMP_PRESETS`` returns one record per preset slot. Collection
+        stops early if a read times out, so a short or interrupted stream
+        yields what did arrive rather than raising.
+
+        Args:
+            data: A 64-byte HID report to send.
+            count: Maximum number of messages to collect.
+            timeout_ms: Timeout for each individual report read.
+
+        Returns:
+            The messages received, in order.
+        """
+        self.write(data)
+
+        frames: list[Frame] = []
+        while len(frames) < count:
+            frame = self.read_message(timeout_ms)
+            if frame is None:
+                logger.debug(
+                    "Stream ended after %d of %d messages", len(frames), count
+                )
+                break
+            frames.append(frame)
+        return frames
+
     def send_chunked_and_receive(
         self,
         frames: list[bytes],
