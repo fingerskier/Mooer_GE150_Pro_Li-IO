@@ -60,10 +60,24 @@ class Command(IntEnum):
     ACTIVE_STATE = 0x30
 
     # --- preset operations ----------------------------------------------
-    READ_PRESET = 0x96  # confirmed: 1-byte slot argument
-    PRESET_NAME = 0x97  # confirmed: slot byte + 16-byte ASCII name
-    PRESET_NAME_NOTIFY = 0x17  # confirmed: same shape, pedal -> host
-    PRESET_CHANGED = 0x34  # confirmed: 1-byte slot, pedal -> host
+    # 0x96 SELECTS a preset -- it is not a read. Confirmed by selecting
+    # 1A / 25B / 50D in the editor and seeing slots 1 / 98 / 200.
+    SELECT_PRESET = 0x96
+    # 0x97 SAVES: it commits the pedal's live edit state to a slot under
+    # the given name, and is also how a rename is performed. There is no
+    # bulk preset upload -- you edit modules live, then commit.
+    SAVE_PRESET = 0x97  # slot byte + 16-byte ASCII name
+    CURRENT_PRESET = 0x16  # 1-byte slot, pedal -> host
+    #: Aliases kept for callers written before these were understood.
+    READ_PRESET = 0x96
+    PRESET_NAME = 0x97
+    PRESET_NAME_NOTIFY = 0x17  # save/rename echoed back by the pedal
+    PRESET_CHANGED = 0x34  # 1-byte selector, pedal -> host
+
+    # --- expression pedal -------------------------------------------------
+    EXP_ASSIGN = 0x98  # [enabled u16, target u16, 0]; notified as 0x18
+    EXP_ASSIGN_NOTIFY = 0x18
+    EXP_STREAM = 0x11  # 18 bytes, pedal -> host, position + calibration
 
     # --- miscellaneous, shape confirmed but meaning not yet pinned down --
     SETTING_A4 = 0xA4  # confirmed: single u16
@@ -373,6 +387,77 @@ def build_read_preset(slot: int) -> bytes:
     if not 0 <= slot <= 199:
         raise ValueError(f"Preset slot must be 0-199, got {slot}")
     return build_command(Command.READ_PRESET, bytes([slot]))
+
+
+def build_select_preset_slot(slot: int) -> bytes:
+    """Build a preset-select command for a 1-based slot.
+
+    Confirmed: selecting 1A / 25B / 50D in the editor sends slots
+    1 / 98 / 200. The pedal answers 0x2A, then 0x29 with the same slot
+    0-based, then 0x34.
+    """
+    _check_slot(slot)
+    return build_command(Command.SELECT_PRESET, bytes([slot]))
+
+
+def build_save_preset(slot: int, name: str) -> bytes:
+    """Build a save command: commit the live edit state to *slot*.
+
+    This is the pedal's only write. There is no bulk preset upload --
+    the editor changes modules live with 0x82-0x8A and then commits with
+    this. It doubles as rename, since the name travels with the save.
+
+    Args:
+        slot: Target preset slot, 1-based (1-200).
+        name: Preset name; ASCII, truncated to 16 bytes and NUL-padded.
+    """
+    _check_slot(slot)
+    encoded = name.encode("ascii", errors="replace")[:PRESET_NAME_LENGTH]
+    return build_command(
+        Command.SAVE_PRESET,
+        bytes([slot]) + encoded.ljust(PRESET_NAME_LENGTH, b"\x00"),
+    )
+
+
+def build_write_preset(
+    slot: int, name: str, modules: dict[Command, ModuleBlock]
+) -> list[bytes]:
+    """Build the full sequence that writes a preset to a slot.
+
+    Mirrors what MOOER Studio does, in order:
+
+    1. select the target slot, so edits land on the right preset
+    2. write each module block that was supplied
+    3. save, which commits the live state under *name*
+
+    Returns:
+        The HID reports to send, in order. Send them with a short gap;
+        the editor paces its own writes roughly 100 ms apart.
+    """
+    reports = [build_select_preset_slot(slot)]
+    for command in MODULE_CHAIN:
+        block = modules.get(command)
+        if block is not None:
+            reports.append(build_command(command, encode_module_block(block)))
+    reports.append(build_save_preset(slot, name))
+    return reports
+
+
+def build_set_exp_assign(target: int, enabled: int = 1) -> bytes:
+    """Build an expression-pedal assignment command.
+
+    Payload is three little-endian u16 words: a mode/enable flag, the
+    assignment target, and a zero. Observed targets: 10 and 12 (the
+    editor was switched to volume and then to DS). The full target
+    enumeration is not known.
+    """
+    for value in (enabled, target):
+        if not 0 <= value <= 0xFFFF:
+            raise ValueError(f"Value must be 0-65535, got {value}")
+    return build_command(
+        Command.EXP_ASSIGN,
+        enabled.to_bytes(2, "little") + target.to_bytes(2, "little") + b"\x00\x00",
+    )
 
 
 def build_hello() -> bytes:

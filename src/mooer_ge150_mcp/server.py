@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,10 @@ from .protocol.commands import (
     build_module_block,
     build_read_active_preset,
     build_read_ir_list,
+    build_save_preset,
+    build_select_preset_slot,
+    build_set_exp_assign,
+    build_write_preset,
     slot_to_address,
     IR_EMPTY_NAME,
     MAX_MODULE_PARAMS,
@@ -65,6 +70,9 @@ from .models.file_formats import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: The editor paces its preset writes roughly this far apart.
+WRITE_PACING_SECONDS = 0.02
 
 mcp = FastMCP(
     "mooer-ge150",
@@ -187,8 +195,10 @@ def _record_to_dict(record: Any) -> dict[str, Any]:
 def _read_active_modules() -> dict[Any, Any] | None:
     """Read the active preset's nine module blocks, or None on failure."""
     conn = _get_connection()
-    response = conn.send_and_receive(build_read_active_preset())
-    if response is None or response.command != Command.ACTIVE_STATE:
+    response = conn.send_and_expect(
+        build_read_active_preset(), Command.ACTIVE_STATE
+    )
+    if response is None:
         return None
     return decode_active_state(response.payload).modules
 
@@ -227,8 +237,10 @@ def connect() -> dict[str, Any]:
     # Hello draws no reply; the active-preset read is what confirms the
     # pedal is actually talking to us.
     _connection.write(build_hello())
-    active = _connection.send_and_receive(build_read_active_preset())
-    if active is not None and active.command == Command.ACTIVE_STATE:
+    active = _connection.send_and_expect(
+        build_read_active_preset(), Command.ACTIVE_STATE
+    )
+    if active is not None:
         state = decode_active_state(active.payload)
         result["active_slot"] = state.slot
         result["active_preset"] = slot_to_address(state.slot)
@@ -267,8 +279,10 @@ def get_device_info() -> dict[str, Any]:
         "product_id": f"0x{info.product_id:04X}",
     }
 
-    active = conn.send_and_receive(build_read_active_preset())
-    if active is not None and active.command == Command.ACTIVE_STATE:
+    active = conn.send_and_expect(
+        build_read_active_preset(), Command.ACTIVE_STATE
+    )
+    if active is not None:
         state = decode_active_state(active.payload)
         result["active_slot"] = state.slot
         result["active_preset"] = slot_to_address(state.slot)
@@ -775,11 +789,9 @@ def import_preset(input_path: str, slot: int) -> dict[str, Any]:
 def list_ir_slots() -> dict[str, Any]:
     """List the user IR slots and their contents."""
     conn = _get_connection()
-    response = conn.send_and_receive(build_read_ir_list())
+    response = conn.send_and_expect(build_read_ir_list(), Command.IR_LIST)
     if response is None:
-        return {"error": "No response from device"}
-    if response.command != Command.IR_LIST:
-        return {"error": f"Unexpected reply 0x{response.command:02X}"}
+        return {"error": "No IR list reply from device"}
 
     names = decode_ir_list(response.payload)
     slots = [
@@ -828,6 +840,128 @@ def upload_ir(slot: int, file_path: str, name: str | None = None) -> dict[str, A
         "slot": slot,
         "name": name or path.stem,
     }
+
+
+# ─── CAPTURE-DERIVED WRITE TOOLS ──────────────────────────────────────
+
+@mcp.tool()
+def select_preset_slot(slot: int) -> dict[str, Any]:
+    """Make a preset active on the pedal.
+
+    Args:
+        slot: Preset slot 0-199.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    _get_connection().write(build_select_preset_slot(slot + FIRST_PRESET_SLOT))
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "selected": True,
+    }
+
+
+@mcp.tool()
+def save_preset(slot: int, name: str) -> dict[str, Any]:
+    """Commit the pedal's current live state to a preset slot.
+
+    This is the pedal's only write. Edit modules first, then save.
+    Saving also sets the name, so this doubles as rename.
+
+    Args:
+        slot: Target preset slot 0-199.
+        name: Preset name, up to 16 ASCII characters.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    _get_connection().write(build_save_preset(slot + FIRST_PRESET_SLOT, name))
+    _record_cache.clear()
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": name[:16],
+        "saved": True,
+    }
+
+
+@mcp.tool()
+def write_preset(
+    slot: int,
+    name: str,
+    modules: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write a complete preset to a slot, the way the editor does.
+
+    Selects the slot, writes each supplied module block, then saves.
+    Modules left out keep whatever the pedal currently has.
+
+    Args:
+        slot: Target preset slot 0-199.
+        name: Preset name, up to 16 ASCII characters.
+        modules: Per-module state, e.g.
+            {"amp": {"enabled": true, "effect_type": 16, "params": [37, 50]}}.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    blocks: dict[Any, Any] = {}
+    for module_name, state in (modules or {}).items():
+        key = MODULE_NAME_ALIASES.get(module_name.lower(), module_name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return {
+                "error": f"Unknown module '{module_name}'. "
+                         f"Valid: {list(MODULE_COMMAND_MAP)}"
+            }
+        try:
+            blocks[MODULE_COMMAND_MAP[key]] = ModuleBlock(
+                enabled=bool(state.get("enabled", True)),
+                effect_type=int(state.get("effect_type", 0)),
+                params=[int(v) for v in state.get("params", [])],
+            )
+        except (TypeError, ValueError) as exc:
+            return {"error": f"Bad state for module '{module_name}': {exc}"}
+
+    conn = _get_connection()
+    try:
+        reports = build_write_preset(slot + FIRST_PRESET_SLOT, name, blocks)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    for report in reports:
+        conn.write(report)
+        time.sleep(WRITE_PACING_SECONDS)
+
+    _record_cache.clear()
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": name[:16],
+        "modules_written": sorted(
+            n for n, c in MODULE_COMMAND_MAP.items() if c in blocks
+        ),
+        "saved": True,
+    }
+
+
+@mcp.tool()
+def set_expression_target(target: int, enabled: int = 1) -> dict[str, Any]:
+    """Assign what the expression pedal controls.
+
+    The target enumeration is not fully known: the captures show 10 and
+    12 as the editor switched to volume and then to DS. Other values are
+    untested.
+
+    Args:
+        target: Assignment target ID.
+        enabled: Mode/enable flag, normally 1.
+    """
+    try:
+        _get_connection().write(build_set_exp_assign(target, enabled))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {"target": target, "enabled": enabled}
 
 
 # ─── MCP RESOURCES ───────────────────────────────────────────────────

@@ -38,7 +38,7 @@ def test_server_imports_and_registers_its_tools():
     import mooer_ge150_mcp.server as real_server
 
     tools = asyncio.run(real_server.mcp.list_tools())
-    assert len(tools) == 22
+    assert len(tools) == 26
     assert "list_ir_slots" in {t.name for t in tools}
 
 
@@ -203,3 +203,107 @@ class TestDeviceInfo:
         """Firmware came from a guessed identify command; it is gone."""
         server, _, _ = wired
         assert "firmware" not in server.get_device_info()
+
+
+class TestWritePath:
+    """The pedal's real write model: select, edit blocks, then save.
+
+    Confirmed in log/test0-2.pcapng: MOOER Studio never uploads a preset
+    blob. It selects a slot, sends module blocks live, then commits with
+    0x97 carrying the slot and name.
+    """
+
+    def test_select_uses_one_based_slots_on_the_wire(self, wired):
+        server, _, pedal = wired
+        result = server.select_preset_slot(199)  # 50D
+        assert result["address"] == "50D"
+        assert pedal.selected == [200]
+
+    def test_save_commits_live_state_under_a_new_name(self, wired):
+        server, _, pedal = wired
+        server.select_preset_slot(199)
+        server.toggle_effect("amp", False)
+
+        result = server.save_preset(199, "ZZTEST")
+
+        assert result["saved"] is True
+        assert result["address"] == "50D"
+        assert pedal.records[200].name == "ZZTEST"
+        assert pedal.records[200].modules[Command.AMP].enabled is False
+
+    def test_save_doubles_as_rename(self, wired):
+        server, _, pedal = wired
+        server.save_preset(0, "Renamed")
+        assert pedal.records[1].name == "Renamed"
+
+    def test_write_preset_selects_then_writes_then_saves(self, wired):
+        server, _, pedal = wired
+        result = server.write_preset(
+            199,
+            "Dual Lead",
+            {"amp": {"enabled": True, "effect_type": 16, "params": [37, 50]}},
+        )
+
+        assert result["saved"] is True
+        assert result["modules_written"] == ["amp"]
+        assert pedal.selected == [200]
+        assert pedal.saves[-1][0] == 200
+
+        amp = pedal.records[200].modules[Command.AMP]
+        assert amp.effect_type == 16
+        assert amp.params[0] == 37
+
+    def test_write_preset_leaves_unlisted_modules_alone(self, wired):
+        server, _, pedal = wired
+        before = pedal.records[1].modules[Command.REVERB]
+
+        server.write_preset(0, "Only Amp", {"amp": {"effect_type": 3}})
+
+        assert [c for c, _ in pedal.written_blocks] == [Command.AMP]
+        assert pedal.records[1].modules[Command.REVERB] == before
+
+    def test_write_preset_accepts_several_modules_in_chain_order(self, wired):
+        server, _, pedal = wired
+        server.write_preset(
+            0,
+            "Multi",
+            {
+                "reverb": {"effect_type": 4, "params": [50, 34]},
+                "amp": {"effect_type": 16},
+            },
+        )
+        # Blocks go out in chain order regardless of dict order.
+        assert [c for c, _ in pedal.written_blocks] == [Command.AMP, Command.REVERB]
+
+    def test_write_preset_rejects_unknown_module(self, wired):
+        server, _, pedal = wired
+        result = server.write_preset(0, "Bad", {"chorus": {"effect_type": 1}})
+        assert "error" in result
+        assert pedal.saves == []
+
+    def test_write_preset_rejects_bad_slot(self, wired):
+        server, _, pedal = wired
+        assert "error" in server.write_preset(200, "Bad", {})
+        assert pedal.saves == []
+
+    def test_name_is_truncated_to_sixteen_characters(self, wired):
+        server, _, pedal = wired
+        server.save_preset(0, "A" * 30)
+        assert pedal.records[1].name == "A" * 16
+
+    def test_saving_invalidates_the_dump_cache(self, wired):
+        server, _, _ = wired
+        server.list_presets(0, 0)
+        assert server._record_cache
+        server.save_preset(0, "New")
+        assert server._record_cache == {}
+
+
+class TestExpressionAssignment:
+    def test_sends_the_observed_shape(self, wired):
+        server, conn, _ = wired
+        assert server.set_expression_target(10) == {"target": 10, "enabled": 1}
+
+    def test_rejects_out_of_range(self, wired):
+        server, _, _ = wired
+        assert "error" in server.set_expression_target(70000)

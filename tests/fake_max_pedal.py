@@ -80,6 +80,8 @@ class FakeMaxPedal:
         self.ir_names: list[str] = ["EMPTY"] * IR_SLOT_COUNT
         self.active_slot = 1
         self.written_blocks: list[tuple[int, ModuleBlock]] = []
+        self.selected: list[int] = []
+        self.saves: list[tuple[int, bytes]] = []
         self._rx_buffer = b""
         self._rx_expected: int | None = None
         self._tx_reports: deque[bytes] = deque()
@@ -154,11 +156,28 @@ class FakeMaxPedal:
             self.records[self.active_slot].modules[Command(command)] = block
             self._respond(response_command(command), payload)
 
-        elif command == Command.PRESET_NAME:
+        elif command == Command.SELECT_PRESET:
+            slot = payload[0]
+            if 1 <= slot <= NUM_SLOTS:
+                self.active_slot = slot
+                self.selected.append(slot)
+            self._respond(0x2A, bytes(9))
+            self._respond(0x29, bytes([slot - 1]) + bytes(9))
+            self._respond(Command.PRESET_CHANGED, b"")
+
+        elif command == Command.SAVE_PRESET:
+            # Commits the live edit state to the slot, under this name.
             slot = payload[0]
             name = payload[1 : 1 + PRESET_NAME_LENGTH]
             if 1 <= slot <= NUM_SLOTS:
-                self.records[slot].name_raw = name
+                live = self.records[self.active_slot]
+                self.records[slot] = PresetRecord(
+                    slot=slot,
+                    name_raw=name,
+                    modules=dict(live.modules),
+                    tail=live.tail,
+                )
+                self.saves.append((slot, name))
             self._respond(Command.PRESET_NAME_NOTIFY, payload)
 
         # Anything else is deliberately unanswered: the captures do not

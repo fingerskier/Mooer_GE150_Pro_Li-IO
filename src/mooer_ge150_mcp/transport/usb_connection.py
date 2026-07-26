@@ -291,6 +291,45 @@ class USBConnection:
         self.write(data)
         return self.read_message(timeout_ms)
 
+    def send_and_expect(
+        self,
+        data: bytes,
+        command: int,
+        timeout_ms: int = READ_TIMEOUT_MS,
+        max_skip: int = 32,
+    ) -> Frame | None:
+        """Send a command and return the first reply with *command*.
+
+        The pedal pushes unsolicited state constantly -- expression-pedal
+        position, preset changes, module echoes -- so the next message on
+        the wire is often not the answer to what was just asked. This
+        skips messages until the expected reply arrives.
+
+        Args:
+            data: A 64-byte HID report to send.
+            command: The reply command ID to wait for.
+            timeout_ms: Timeout for each individual report read.
+            max_skip: Give up after this many unrelated messages.
+
+        Returns:
+            The matching Frame, or None on timeout or if too many
+            unrelated messages arrived first.
+        """
+        self.write(data)
+
+        for _ in range(max_skip + 1):
+            frame = self.read_message(timeout_ms)
+            if frame is None:
+                return None
+            if frame.command == command:
+                return frame
+            logger.debug(
+                "Skipping unsolicited 0x%02X while awaiting 0x%02X",
+                frame.command, command,
+            )
+        logger.warning("Gave up waiting for 0x%02X", command)
+        return None
+
     def send_and_collect(
         self,
         data: bytes,
