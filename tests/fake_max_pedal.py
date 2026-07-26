@@ -196,7 +196,8 @@ class FakeMaxPedal:
                     tail=live.tail,
                 )
                 self.saves.append((slot, name))
-            self._respond(Command.PRESET_NAME_NOTIFY, payload)
+            # Hardware does not reply to an app-initiated save; 0x17 only
+            # accompanies saves made on the pedal itself.
 
         elif command == Command.UPLOAD_CAB:
             seq = payload[0]

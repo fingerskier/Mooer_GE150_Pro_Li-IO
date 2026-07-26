@@ -275,11 +275,12 @@ def _write_record_live(conn, slot: int, record) -> bool:
             continue
         conn.write(build_command(command, encode_module_block(block)))
         time.sleep(WRITE_PACING_SECONDS)
-    ack = conn.send_and_expect(
-        build_save_preset(slot, record.name), Command.PRESET_NAME_NOTIFY
-    )
+    # An app-initiated save draws no reply (0x17 only accompanies saves
+    # made on the pedal itself), so this is fire-and-forget plus pacing.
+    conn.write(build_save_preset(slot, record.name))
+    time.sleep(0.15)
     _record_cache.clear()
-    return ack is not None
+    return True
 
 
 def _merge_module_states(
@@ -566,13 +567,11 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
     # live, then commit that state to the destination slot.
     conn.write(build_select_preset_slot(from_slot + FIRST_PRESET_SLOT))
     time.sleep(0.1)
-    ack = conn.send_and_expect(
-        build_save_preset(to_slot + FIRST_PRESET_SLOT, source.name),
-        Command.PRESET_NAME_NOTIFY,
-    )
+    conn.write(build_save_preset(to_slot + FIRST_PRESET_SLOT, source.name))
+    time.sleep(0.15)
     _record_cache.clear()
     return {
-        "copied": ack is not None,
+        "copied": True,
         "from": from_slot,
         "to": to_slot,
         "name": source.name,
@@ -1002,7 +1001,11 @@ def upload_cab(index: int, name: str, blob_hex: str) -> dict[str, Any]:
         for report in message:
             conn.write(report)
             time.sleep(WRITE_PACING_SECONDS)
-        reply = conn.read_message()
+        reply = None
+        for _ in range(8):
+            reply = conn.read_message()
+            if reply is None or reply.command == Command.UPLOAD_CAB:
+                break
         if reply is None or reply.command != Command.UPLOAD_CAB:
             return {"error": "No ack for cab upload message"}
 
@@ -1041,7 +1044,11 @@ def upload_amp(index: int, name: str, blob_hex: str) -> dict[str, Any]:
         for report in message:
             conn.write(report)
             time.sleep(WRITE_PACING_SECONDS)
-        reply = conn.read_message()
+        reply = None
+        for _ in range(8):
+            reply = conn.read_message()
+            if reply is None or reply.command == Command.UPLOAD_AMP_ACK:
+                break
         if reply is None or reply.command != Command.UPLOAD_AMP_ACK:
             return {"error": "No ack for amp upload message"}
 
