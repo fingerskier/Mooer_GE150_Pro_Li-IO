@@ -68,7 +68,9 @@ from .transport.usb_connection import USBConnection
 
 logger = logging.getLogger(__name__)
 
-#: The editor paces its preset writes roughly this far apart.
+#: Pacing between HID reports and messages. Unpaced writes are not
+#: merely unreliable: back-to-back bracketed records made the pedal
+#: watchdog-reboot in live testing (2026-07-26).
 WRITE_PACING_SECONDS = 0.02
 
 #: File-format tags for backups and single-preset exports.
@@ -160,6 +162,16 @@ def _fetch_all_records(refresh: bool = True) -> dict[int, Any]:
         build_dump_presets(), LAST_PRESET_SLOT,
         command=Command.PRESET_RECORD,
     )
+    if not frames:
+        # After RESTORE_END the pedal spends a couple of seconds
+        # rebroadcasting its state and ignores a dump request (observed
+        # live). One paced retry covers it.
+        logger.debug("Dump returned nothing; retrying after settle")
+        time.sleep(2.5)
+        frames = conn.send_and_collect(
+            build_dump_presets(), LAST_PRESET_SLOT,
+            command=Command.PRESET_RECORD,
+        )
 
     records: dict[int, Any] = {}
     for frame in frames:
@@ -216,10 +228,12 @@ def _upload_records(conn, records: list) -> int:
     """
     acked = 0
     conn.write(build_restore_begin())
+    time.sleep(WRITE_PACING_SECONDS)
     try:
         for record in records:
             for report in build_write_preset_record(record):
                 conn.write(report)
+                time.sleep(WRITE_PACING_SECONDS)
             for _ in range(8):
                 ack = conn.read_message()
                 if ack is None:
@@ -227,6 +241,9 @@ def _upload_records(conn, records: list) -> int:
                 if ack.command == Command.WRITE_PRESET_ACK:
                     acked += 1
                     break
+            # The editor paces successive records ~100 ms apart; sending
+            # them back-to-back rebooted the pedal in live testing.
+            time.sleep(0.1)
     finally:
         conn.write(build_restore_end())
     _record_cache.clear()
@@ -943,6 +960,7 @@ def upload_cab(index: int, name: str, blob_hex: str) -> dict[str, Any]:
     for message in messages:
         for report in message:
             conn.write(report)
+            time.sleep(WRITE_PACING_SECONDS)
         reply = conn.read_message()
         if reply is None or reply.command != Command.UPLOAD_CAB:
             return {"error": "No ack for cab upload message"}
@@ -981,6 +999,7 @@ def upload_amp(index: int, name: str, blob_hex: str) -> dict[str, Any]:
     for message in messages:
         for report in message:
             conn.write(report)
+            time.sleep(WRITE_PACING_SECONDS)
         reply = conn.read_message()
         if reply is None or reply.command != Command.UPLOAD_AMP_ACK:
             return {"error": "No ack for amp upload message"}
