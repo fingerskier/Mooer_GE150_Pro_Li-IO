@@ -81,7 +81,7 @@ class FakePedal:
     def _handle_command(self, command: int, payload: bytes) -> None:
         if command == Command.IDENTIFY:
             self._respond(command, self.firmware + self.device_name)
-        elif command == Command.PRESET:
+        elif command == Command.READ_PRESET:
             slot = payload[0]
             if len(payload) == 1:
                 # Read request → respond with slot + 512 bytes of preset data
@@ -98,7 +98,7 @@ class FakePedal:
                 PRESET_SIZE, b"\x00"
             )
             self._respond(command, bytes([slot]))
-        elif command == Command.ACTIVE_PATCH:
+        elif command == Command.SETTING_A6:
             if len(payload) >= 1:
                 self.active_slot = payload[0]
             self._respond(command, bytes([self.active_slot]))

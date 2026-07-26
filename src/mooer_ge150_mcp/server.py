@@ -470,7 +470,7 @@ def set_effect_order(order: list[str]) -> dict[str, Any]:
     order_bytes = order_bytes.ljust(10, b"\x00")
 
     conn = _get_connection()
-    frame = build_command(Command.PATCH_SETTING, order_bytes)
+    frame = build_command(Command.SETTING_A5, order_bytes)
     conn.write(frame)
 
     return {"order": order}
@@ -668,7 +668,7 @@ def list_ir_slots() -> dict[str, Any]:
     """List the user IR slots and their contents."""
     conn = _get_connection()
     response = conn.send_and_receive(
-        build_command(Command.CAB_MODELS)
+        build_command(Command.CAB)
     )
     if response is None:
         return {"error": "No response from device"}

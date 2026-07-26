@@ -7,11 +7,17 @@ Frame layout::
     | 1 byte   | 2 bytes | 2 bytes | 1 byte  |  variable length |  2 bytes | to 64 B |
     +----------+---------+---------+---------+------------------+----------+---------+
 
-- HID Size: number of meaningful bytes that follow (excludes itself)
+- HID Size: number of meaningful bytes that follow (excludes itself),
+  always ``4 + size + 2``
 - Preamble: 0xAA 0x55
 - Size: little-endian length of (command byte + payload)
-- Checksum: inverted CRC-16 over (command + payload), little-endian
+- Checksum: inverted CRC-16 over (size field + command + payload),
+  stored big-endian
 - Padding: zero bytes to fill 64-byte HID report
+
+The checksum range and byte order were confirmed against all 146 protocol
+messages in ``log/various_tests.pcapng`` (MOOER Studio <-> GE150 Pro Li).
+Note that the preamble is *not* covered, but the size field is.
 """
 
 from __future__ import annotations
@@ -24,6 +30,20 @@ PREAMBLE = b"\xAA\x55"
 HID_REPORT_SIZE = 64
 # 64 - 1(hid_size) - 2(preamble) - 2(size) - 1(cmd) - 2(checksum)
 MAX_PAYLOAD_PER_FRAME = 56
+
+
+def frame_checksum(size_and_body: bytes) -> int:
+    """Compute the 2-byte frame checksum.
+
+    Args:
+        size_and_body: The little-endian size field followed by the
+            command byte and payload -- i.e. everything between the
+            preamble and the checksum.
+
+    Returns:
+        The checksum as an integer; serialise it **big-endian**.
+    """
+    return crc16(size_and_body)
 
 
 @dataclass
@@ -61,7 +81,7 @@ def build_frame(command: int, payload: bytes = b"") -> bytes:
         )
     body = bytes([command]) + payload
     size = len(body).to_bytes(2, "little")
-    checksum = crc16(body).to_bytes(2, "little")
+    checksum = frame_checksum(size + body).to_bytes(2, "big")
     frame = PREAMBLE + size + body + checksum
     hid_size = len(frame)
     # HID report: 1-byte size prefix + frame + zero padding to 64 bytes
@@ -81,7 +101,7 @@ def build_chunked_frames(command: int, payload: bytes) -> list[bytes]:
     """
     body = bytes([command]) + payload
     size_bytes = len(body).to_bytes(2, "little")
-    checksum = crc16(body).to_bytes(2, "little")
+    checksum = frame_checksum(size_bytes + body).to_bytes(2, "big")
     full_message = PREAMBLE + size_bytes + body + checksum
 
     # If it fits in one report (with the 1-byte hid_size prefix)
@@ -128,11 +148,10 @@ def parse_message(assembled: bytes) -> Frame | None:
     command = assembled[4]
     payload = assembled[5 : 4 + body_size]
 
-    body = assembled[4 : 4 + body_size]
     expected_checksum = int.from_bytes(
-        assembled[4 + body_size : 4 + body_size + 2], "little"
+        assembled[4 + body_size : 4 + body_size + 2], "big"
     )
-    if crc16(body) != expected_checksum:
+    if frame_checksum(assembled[2 : 4 + body_size]) != expected_checksum:
         return None
 
     return Frame(command=command, payload=payload)

@@ -14,7 +14,7 @@ from mooer_ge150_mcp.protocol.framing import Frame
 
 def _make_preset_frame(slot: int, preset: Preset) -> Frame:
     """Build a Frame that parse_preset_response can parse."""
-    return Frame(command=Command.PRESET, payload=bytes([slot]) + preset.to_bytes())
+    return Frame(command=Command.READ_PRESET, payload=bytes([slot]) + preset.to_bytes())
 
 
 def _create_backup(presets: list[Preset]) -> str:

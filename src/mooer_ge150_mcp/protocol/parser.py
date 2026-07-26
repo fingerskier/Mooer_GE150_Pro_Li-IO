@@ -90,7 +90,7 @@ def parse_identify(frame: Frame) -> IdentifyResponse | None:
 
 def parse_preset_response(frame: Frame) -> PresetResponse | None:
     """Parse a Preset response frame."""
-    if frame.command != Command.PRESET:
+    if frame.command != Command.READ_PRESET:
         return None
 
     if len(frame.payload) < 1:
@@ -103,7 +103,7 @@ def parse_preset_response(frame: Frame) -> PresetResponse | None:
 
 def parse_active_patch(frame: Frame) -> ActivePatchResponse | None:
     """Parse an ActivePatch response."""
-    if frame.command != Command.ACTIVE_PATCH:
+    if frame.command != Command.SETTING_A6:
         return None
     if len(frame.payload) < 1:
         return None
@@ -134,8 +134,8 @@ def parse_response(frame: Frame):
     """
     parsers = {
         Command.IDENTIFY: parse_identify,
-        Command.PRESET: parse_preset_response,
-        Command.ACTIVE_PATCH: parse_active_patch,
+        Command.READ_PRESET: parse_preset_response,
+        Command.SETTING_A6: parse_active_patch,
         Command.VOLUME: parse_volume,
         Command.SYSTEM: parse_system,
     }

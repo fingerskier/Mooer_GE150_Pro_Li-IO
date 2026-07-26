@@ -18,13 +18,23 @@ from mooer_ge150_mcp.protocol.framing import parse_frame, HID_REPORT_SIZE
 
 
 def test_command_enum_values():
-    """Verify key command IDs match the spec."""
+    """Verify key command IDs match the USB capture.
+
+    The effect-module and preset IDs come from ``log/various_tests.pcapng``;
+    IDENTIFY/VOLUME/SYSTEM/STORE_PATCH never appeared there and remain
+    provisional.
+    """
+    assert Command.FX == 0x82
+    assert Command.AMP == 0x84
+    assert Command.CAB == 0x85
+    assert Command.REVERB == 0x89
+    assert Command.READ_PRESET == 0x96
+    assert Command.PRESET_NAME == 0x97
+    assert Command.SETTING_A6 == 0xA6
+    assert Command.POLL == 0xB4
+
     assert Command.IDENTIFY == 0x10
-    assert Command.ACTIVE_PATCH == 0xA6
     assert Command.STORE_PATCH == 0xA8
-    assert Command.FX == 0x90
-    assert Command.AMP == 0x93
-    assert Command.REVERB == 0x99
     assert Command.VOLUME == 0xA2
     assert Command.SYSTEM == 0xA1
 
@@ -39,11 +49,16 @@ def test_build_identify():
 
 
 def test_build_select_preset():
-    """Select preset should embed the slot index."""
+    """Select preset should embed the slot index.
+
+    0xA6 carries two u16 flags in the capture, not a slot index, so this
+    now rides on the confirmed preset-read ID until a real preset-select
+    exchange is captured.
+    """
     frame = build_select_preset(42)
     parsed = parse_frame(frame)
     assert parsed is not None
-    assert parsed.command == Command.ACTIVE_PATCH
+    assert parsed.command == Command.READ_PRESET
     assert parsed.payload == bytes([42])
 
 
@@ -60,7 +75,7 @@ def test_build_read_preset():
     frame = build_read_preset(0)
     parsed = parse_frame(frame)
     assert parsed is not None
-    assert parsed.command == Command.PRESET
+    assert parsed.command == Command.READ_PRESET
     assert parsed.payload == bytes([0])
 
 

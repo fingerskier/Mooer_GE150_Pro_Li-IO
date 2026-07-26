@@ -1,8 +1,10 @@
 """USB HID connection to the Mooer GE150 Pro Li.
 
 Supports both ``hidapi`` (preferred) and ``pyusb`` backends.
-The device presents as a USB composite device; we communicate on
-Interface 3 (HID) with endpoints 0x81 (IN) and 0x02 (OUT).
+The device presents as a USB composite device (audio + MIDI + HID). The
+editor protocol runs on the HID interface, which the USB configuration
+descriptor in ``log/various_tests.pcapng`` places at interface 5 with
+64-byte interrupt endpoints 0x85 (IN) and 0x05 (OUT).
 """
 
 from __future__ import annotations
@@ -20,12 +22,17 @@ from ..protocol.framing import (
 
 logger = logging.getLogger(__name__)
 
-VENDOR_ID = 0x0483
-PRODUCT_ID = 0x5703
-HID_INTERFACE = 3
-EP_IN = 0x81
-EP_OUT = 0x02
+VENDOR_ID = 0x34DB
+PRODUCT_ID = 0x000F
+HID_INTERFACE = 5
+EP_IN = 0x85
+EP_OUT = 0x05
 READ_TIMEOUT_MS = 1000
+
+#: The IDs this repo targeted before the USB capture. They belong to the
+#: older STM32-based Mooer units (GE200 and relatives), not to this pedal.
+LEGACY_VENDOR_ID = 0x0483
+LEGACY_PRODUCT_ID = 0x5703
 
 
 @dataclass
