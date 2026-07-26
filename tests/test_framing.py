@@ -40,7 +40,7 @@ def test_build_frame_command_byte():
 def test_build_frame_select_preset_3():
     """Verify frame structure for selecting preset 3 (index 2).
 
-    Structure: [hid_size] AA 55 [size_lo size_hi] [cmd] [payload] [crc_lo crc_hi]
+    Structure: [hid_size] AA 55 [size_lo size_hi] [cmd] [payload] [crc_hi crc_lo]
     """
     frame = build_frame(0xA6, b"\x02")
     assert frame[0] == 0x08  # hid_size: 8 meaningful bytes
@@ -50,10 +50,11 @@ def test_build_frame_select_preset_3():
     assert frame[4] == 0x00  # size high byte
     assert frame[5] == 0xA6  # command (ActivePatch)
     assert frame[6] == 0x02  # payload (preset index 2)
-    # Checksum: CRC-16 of [0xA6, 0x02], little-endian
-    expected_crc = crc16(bytes([0xA6, 0x02]))
-    assert frame[7] == expected_crc & 0xFF          # crc low byte
-    assert frame[8] == (expected_crc >> 8) & 0xFF    # crc high byte
+    # Checksum: CRC-16 over the size field + body, stored big-endian.
+    # Confirmed against all 146 messages in log/various_tests.pcapng.
+    expected_crc = crc16(bytes([0x02, 0x00, 0xA6, 0x02]))
+    assert frame[7] == (expected_crc >> 8) & 0xFF    # crc high byte
+    assert frame[8] == expected_crc & 0xFF           # crc low byte
 
 
 def test_roundtrip_parse():

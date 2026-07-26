@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -15,48 +16,75 @@ from mcp.server.fastmcp import FastMCP
 
 from .protocol.commands import (
     Command,
-    build_identify,
-    build_select_preset,
-    build_read_preset,
-    build_store_preset,
-    build_effect_param,
-    build_toggle_effect,
-    build_set_volume,
-    build_get_volume,
-    build_get_system_settings,
-    build_set_system_setting,
+    MODULE_CHAIN,
+    MODULE_COMMAND_MAP,
+    FIRST_PRESET_SLOT,
+    LAST_PRESET_SLOT,
+    decode_active_state,
+    decode_ir_list,
+    decode_preset_record,
+    build_dump_presets,
+    build_hello,
+    build_module_block,
+    build_read_active_preset,
+    build_read_ir_list,
+    build_save_preset,
+    build_select_preset_slot,
+    build_set_exp_assign,
+    build_write_preset,
+    build_write_preset_record,
+    build_read_ctrl_config,
+    build_write_ctrl_config,
+    build_set_input_level,
+    build_set_otg_level,
+    build_set_brightness,
+    build_set_cab_sim_thru,
+    build_set_spillover,
+    build_set_global_eq,
+    decode_global_eq,
+    GlobalEQ,
+    build_restore_begin,
+    build_restore_end,
+    decode_ctrl_config,
+    db_to_level,
+    level_to_db,
+    CTRL_FLAG_COUNT,
+    PresetRecord,
+    slot_to_address,
+    IR_EMPTY_NAME,
+    AMP_BLOB_SIZE,
+    CAB_BLOB_SIZE,
+    build_upload_amp,
+    build_upload_cab,
+    split_user_model_list,
+    MAX_MODULE_PARAMS,
+    MODULE_NAME_ALIASES,
+    ModuleBlock,
+    encode_module_block,
+    encode_preset_record,
+    PRESET_RECORD_SIZE,
     build_command,
 )
-from .protocol.parser import (
-    parse_identify,
-    parse_preset_response,
-    parse_active_patch,
-    parse_volume,
-    parse_system,
-)
 from .transport.usb_connection import USBConnection
-from .models.preset import Preset, MODULE_NAMES, PRESET_SIZE
-from .models.effects import MODULE_CLASSES
-from .models.system import SystemSettings
-from .models.file_formats import (
-    export_mo,
-    import_mo,
-    export_mbf,
-    import_mbf,
-    parse_gnr_header,
-    MBF_PRESET_COUNT,
-)
 
 logger = logging.getLogger(__name__)
 
+#: Pacing between HID reports and messages. Unpaced writes are not
+#: merely unreliable: back-to-back bracketed records made the pedal
+#: watchdog-reboot in live testing (2026-07-26).
+WRITE_PACING_SECONDS = 0.02
+
+#: File-format tags for backups and single-preset exports.
+BACKUP_FORMAT = "mooer-ge150-backup"
+PRESET_FORMAT = "mooer-ge150-preset"
+
 mcp = FastMCP(
     "mooer-ge150",
-    description="MCP server for Mooer GE150 Pro Li guitar effects pedal",
+    instructions="Control a Mooer GE150 Max guitar effects pedal over USB.",
 )
 
 # Global connection state
 _connection: USBConnection | None = None
-_preset_cache: dict[int, Preset] = {}
 
 
 def _get_connection() -> USBConnection:
@@ -112,15 +140,217 @@ EFFECT_CATALOG = {
 }
 
 
+# ─── CAPTURE-DERIVED HELPERS ──────────────────────────────────────────
+
+#: Records from the last bulk dump, keyed by 0-199 server slot.
+_record_cache: dict[int, Any] = {}
+
+
+def _fetch_all_records(refresh: bool = True) -> dict[int, Any]:
+    """Pull every preset via the bulk dump, keyed by 0-199 server slot.
+
+    The pedal answers DUMP_PRESETS with one record per slot -- there is
+    no confirmed way to read a single preset, so reading one means
+    reading all of them. Results are cached; pass ``refresh=False`` to
+    reuse the previous dump.
+    """
+    global _record_cache
+    if _record_cache and not refresh:
+        return _record_cache
+
+    conn = _get_connection()
+    frames = conn.send_and_collect(
+        build_dump_presets(), LAST_PRESET_SLOT,
+        command=Command.PRESET_RECORD,
+    )
+    if not frames:
+        # After RESTORE_END the pedal spends a couple of seconds
+        # rebroadcasting its state and ignores a dump request (observed
+        # live). One paced retry covers it.
+        logger.debug("Dump returned nothing; retrying after settle")
+        time.sleep(2.5)
+        frames = conn.send_and_collect(
+            build_dump_presets(), LAST_PRESET_SLOT,
+            command=Command.PRESET_RECORD,
+        )
+
+    records: dict[int, Any] = {}
+    for frame in frames:
+        if frame.command != Command.PRESET_RECORD:
+            continue
+        try:
+            record = decode_preset_record(frame.payload)
+        except ValueError:
+            logger.warning("Skipping malformed preset record")
+            continue
+        records[record.slot - FIRST_PRESET_SLOT] = record
+
+    if records:
+        _record_cache = records
+    return records
+
+
+def _record_to_dict(record: Any) -> dict[str, Any]:
+    """Render a PresetRecord as JSON-friendly output."""
+    names = {command: name for name, command in MODULE_COMMAND_MAP.items()}
+    return {
+        "slot": record.slot - FIRST_PRESET_SLOT,
+        "address": slot_to_address(record.slot),
+        "name": record.name,
+        "modules": {
+            names[command]: {
+                "enabled": record.modules[command].enabled,
+                "effect_type": record.modules[command].effect_type,
+                "params": record.modules[command].params,
+            }
+            for command in MODULE_CHAIN
+        },
+    }
+
+
+def _read_active_modules() -> dict[Any, Any] | None:
+    """Read the active preset's nine module blocks, or None on failure."""
+    conn = _get_connection()
+    response = conn.send_and_expect(
+        build_read_active_preset(), Command.ACTIVE_STATE
+    )
+    if response is None:
+        return None
+    return decode_active_state(response.payload).modules
+
+
+
+def _upload_records(conn, records: list) -> int:
+    """Upload preset records via WRITE_PRESET inside a restore bracket.
+
+    0xC3 has only ever been observed between RESTORE_BEGIN and
+    RESTORE_END, so every direct write uses the same bracket. Returns the
+    number of records the pedal acknowledged.
+    """
+    acked = 0
+    conn.write(build_restore_begin())
+    time.sleep(WRITE_PACING_SECONDS)
+    try:
+        for record in records:
+            for report in build_write_preset_record(record):
+                conn.write(report)
+                time.sleep(WRITE_PACING_SECONDS)
+            for _ in range(8):
+                ack = conn.read_message()
+                if ack is None:
+                    break
+                if ack.command == Command.WRITE_PRESET_ACK:
+                    acked += 1
+                    break
+            # The editor paces successive records ~100 ms apart; sending
+            # them back-to-back rebooted the pedal in live testing.
+            time.sleep(0.1)
+    finally:
+        conn.write(build_restore_end())
+    _record_cache.clear()
+    return acked
+
+
+def _write_record_live(conn, slot: int, record) -> bool:
+    """Write a record's modules + name via the live path: select the
+    slot, write each module block, then commit with SAVE (0x97).
+
+    Unlike the 0xC3 bracket this does not reboot the pedal, so it is the
+    right shape for interactive single-slot writes. The 12-byte tail is
+    not writable this way; the slot keeps its existing tail.
+
+    Args:
+        conn: Open connection.
+        slot: Wire slot, 1-based.
+        record: PresetRecord whose modules and name to write.
+
+    Returns:
+        True if the pedal echoed the save (0x17).
+    """
+    conn.write(build_select_preset_slot(slot))
+    time.sleep(0.1)
+    for command in MODULE_CHAIN:
+        block = record.modules.get(command)
+        if block is None:
+            continue
+        conn.write(build_command(command, encode_module_block(block)))
+        time.sleep(WRITE_PACING_SECONDS)
+    # An app-initiated save draws no reply (0x17 only accompanies saves
+    # made on the pedal itself), so this is fire-and-forget plus pacing.
+    conn.write(build_save_preset(slot, record.name))
+    time.sleep(0.15)
+    _record_cache.clear()
+    return True
+
+
+def _merge_module_states(
+    record, modules: dict[str, dict[str, Any]]
+) -> str | None:
+    """Apply per-module overrides onto a PresetRecord.
+
+    Returns an error message, or None on success.
+    """
+    for module_name, state in (modules or {}).items():
+        key = MODULE_NAME_ALIASES.get(module_name.lower(), module_name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return (
+                f"Unknown module '{module_name}'. "
+                f"Valid: {list(MODULE_COMMAND_MAP)}"
+            )
+        unknown = set(state) - {"enabled", "effect_type", "params"}
+        if unknown:
+            return (
+                f"Unknown fields {sorted(unknown)} for module "
+                f"'{module_name}'. Modules take enabled / effect_type / "
+                f"params (see get_preset output)."
+            )
+        command = MODULE_COMMAND_MAP[key]
+        block = record.modules.get(
+            command, ModuleBlock(enabled=False, effect_type=0)
+        )
+        try:
+            record.modules[command] = ModuleBlock(
+                enabled=bool(state.get("enabled", block.enabled)),
+                effect_type=int(state.get("effect_type", block.effect_type)),
+                params=[int(v) for v in state.get("params", block.params)],
+            )
+        except (TypeError, ValueError) as exc:
+            return f"Bad state for module '{module_name}': {exc}"
+    return None
+
+
+def _record_to_file_entry(record) -> dict[str, Any]:
+    """A JSON-safe preset entry carrying the byte-exact record."""
+    return {
+        "slot": record.slot - FIRST_PRESET_SLOT,
+        "address": slot_to_address(record.slot),
+        "name": record.name,
+        "record": encode_preset_record(record).hex(),
+    }
+
+
+def _record_from_file_entry(entry: dict[str, Any], slot: int):
+    """Rebuild a PresetRecord from a file entry, re-slotted to *slot*
+    (0-199). Raises ValueError on malformed input."""
+    raw = bytearray(bytes.fromhex(str(entry["record"])))
+    if len(raw) != PRESET_RECORD_SIZE:
+        raise ValueError(
+            f"Preset record must be {PRESET_RECORD_SIZE} bytes, "
+            f"got {len(raw)}"
+        )
+    raw[0] = slot + FIRST_PRESET_SLOT
+    return decode_preset_record(bytes(raw))
+
+
 # ─── CONNECTION TOOLS ─────────────────────────────────────────────────
 
 @mcp.tool()
 def connect() -> dict[str, Any]:
-    """Establish a USB connection to the Mooer GE150 Pro Li pedal.
+    """Establish a USB connection to the pedal.
 
-    Auto-discovers the device by USB vendor/product ID (0x0483:0x5703).
-    Sends an Identify command to confirm the device and retrieve
-    model and firmware information.
+    Auto-discovers the device by USB vendor/product ID and performs the
+    handshake MOOER Studio uses: a hello, then a read of the active
+    preset. Model and manufacturer come from the USB descriptors.
     """
     global _connection
     if _connection is not None and _connection.connected:
@@ -137,21 +367,24 @@ def connect() -> dict[str, Any]:
         _connection = None
         raise
 
-    # Send Identify command
-    identify_frame = build_identify()
-    response = _connection.send_and_receive(identify_frame)
-
     result: dict[str, Any] = {
         "connected": True,
         "model": info.product,
         "manufacturer": info.manufacturer,
     }
 
-    if response:
-        ident = parse_identify(response)
-        if ident:
-            result["firmware"] = ident.firmware
-            result["device_name"] = ident.device_name
+    # Hello draws no reply; the active-preset read is what confirms the
+    # pedal is actually talking to us.
+    _connection.write(build_hello())
+    active = _connection.send_and_expect(
+        build_read_active_preset(), Command.ACTIVE_STATE
+    )
+    if active is not None:
+        state = decode_active_state(active.payload)
+        result["active_slot"] = state.slot
+        result["active_preset"] = slot_to_address(state.slot)
+    else:
+        result["warning"] = "Connected, but the pedal did not report its state"
 
     return result
 
@@ -169,24 +402,31 @@ def disconnect() -> dict[str, bool]:
 
 @mcp.tool()
 def get_device_info() -> dict[str, Any]:
-    """Retrieve device identification (model, firmware version).
+    """Report what is known about the connected device.
 
-    Sends the Identify command (0x10) and parses the response.
+    Model and manufacturer come from the USB descriptors. Firmware
+    version is not reported: no identify exchange appears in either USB
+    capture, so there is no verified way to ask for it.
     """
     conn = _get_connection()
-    response = conn.send_and_receive(build_identify())
-    if response is None:
-        return {"error": "No response from device"}
+    info = conn.device_info
 
-    ident = parse_identify(response)
-    if ident is None:
-        return {"error": "Failed to parse identify response"}
-
-    return {
-        "model": ident.device_name,
-        "firmware": ident.firmware,
-        "manufacturer": conn.device_info.manufacturer,
+    result: dict[str, Any] = {
+        "model": info.product,
+        "manufacturer": info.manufacturer,
+        "vendor_id": f"0x{info.vendor_id:04X}",
+        "product_id": f"0x{info.product_id:04X}",
     }
+
+    active = conn.send_and_expect(
+        build_read_active_preset(), Command.ACTIVE_STATE
+    )
+    if active is not None:
+        state = decode_active_state(active.payload)
+        result["active_slot"] = state.slot
+        result["active_preset"] = slot_to_address(state.slot)
+
+    return result
 
 
 # ─── PRESET MANAGEMENT TOOLS ─────────────────────────────────────────
@@ -204,26 +444,24 @@ def list_presets(start: int = 0, end: int = 199) -> dict[str, Any]:
     if start > end:
         start, end = end, start
 
-    conn = _get_connection()
+    records = _fetch_all_records()
+    if not records:
+        return {"error": "No response from device"}
+
     presets = []
     for slot in range(start, end + 1):
-        response = conn.send_and_receive(build_read_preset(slot))
-        if response:
-            parsed = parse_preset_response(response)
-            if parsed:
-                preset = Preset.from_bytes(parsed.data)
-                _preset_cache[slot] = preset
-                presets.append({
-                    "slot": slot,
-                    "name": preset.name,
-                    "empty": not preset.name.strip(),
-                })
-            else:
-                presets.append({"slot": slot, "name": "", "empty": True})
-        else:
+        record = records.get(slot)
+        if record is None:
             presets.append({"slot": slot, "name": "", "empty": True})
+            continue
+        presets.append({
+            "slot": slot,
+            "address": slot_to_address(record.slot),
+            "name": record.name,
+            "empty": not record.name.strip(),
+        })
 
-    return {"presets": presets}
+    return {"presets": presets, "received": len(records)}
 
 
 @mcp.tool()
@@ -236,21 +474,12 @@ def get_preset(slot: int) -> dict[str, Any]:
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
 
-    conn = _get_connection()
-    response = conn.send_and_receive(build_read_preset(slot))
-    if response is None:
-        return {"error": "No response from device"}
+    records = _fetch_all_records()
+    record = records.get(slot)
+    if record is None:
+        return {"error": f"Device did not return a record for slot {slot}"}
 
-    parsed = parse_preset_response(response)
-    if parsed is None:
-        return {"error": "Failed to parse preset response"}
-
-    preset = Preset.from_bytes(parsed.data)
-    _preset_cache[slot] = preset
-
-    result = preset.to_dict()
-    result["slot"] = slot
-    return result
+    return _record_to_dict(record)
 
 
 @mcp.tool()
@@ -259,48 +488,43 @@ def set_preset(
     name: str | None = None,
     effects: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Write a complete preset to a slot.
+    """Update a preset in place: merge changes over what the slot holds.
 
-    If a preset already exists in the slot, it is read first and the
-    provided fields are merged over it.
+    Reads the slot's current record (via the bulk dump), applies the
+    given name and module overrides, and writes the merged record back
+    with the confirmed direct-write command (0xC3).
 
     Args:
         slot: Target slot (0-199).
-        name: Optional new preset name (max 14 chars).
-        effects: Optional dict of module overrides, e.g.
-                 {"amp": {"type": 5, "amp_gain": 128}}.
+        name: Optional new preset name (max 16 chars).
+        effects: Optional per-module overrides using the same shape
+            get_preset returns, e.g.
+            ``{"amp": {"enabled": true, "effect_type": 5, "params": [90]}}``.
     """
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
 
     conn = _get_connection()
+    records = _fetch_all_records(refresh=False)
+    record = records.get(slot)
+    if record is None:
+        record = PresetRecord(slot=slot + FIRST_PRESET_SLOT)
+        for command in MODULE_CHAIN:
+            record.modules[command] = ModuleBlock(enabled=False, effect_type=0)
 
-    # Start from cached or freshly-read preset
-    if slot in _preset_cache:
-        preset = _preset_cache[slot]
-    else:
-        response = conn.send_and_receive(build_read_preset(slot))
-        if response:
-            parsed = parse_preset_response(response)
-            preset = Preset.from_bytes(parsed.data) if parsed else Preset()
-        else:
-            preset = Preset()
+    error = _merge_module_states(record, effects or {})
+    if error:
+        return {"error": error}
 
     if name is not None:
-        preset.name = name[:14]
-
-    if effects:
-        for module_name, params in effects.items():
-            module = preset.get_module(module_name)
-            for param, value in params.items():
-                if hasattr(module, param):
-                    setattr(module, param, value)
-
-    frames = build_store_preset(slot, preset.to_bytes())
-    response = conn.send_chunked_and_receive(frames)
-    _preset_cache[slot] = preset
-
-    return {"stored": True, "slot": slot, "name": preset.name}
+        record = record.with_name(name)
+    stored = _write_record_live(conn, slot + FIRST_PRESET_SLOT, record)
+    return {
+        "stored": stored,
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": record.name,
+    }
 
 
 @mcp.tool()
@@ -313,18 +537,18 @@ def select_preset(slot: int) -> dict[str, Any]:
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
 
-    conn = _get_connection()
-    response = conn.send_and_receive(build_select_preset(slot))
-    if response:
-        parsed = parse_active_patch(response)
-        if parsed:
-            return {"active": parsed.slot}
-    return {"active": slot}
+    # The wire slot is 1-based; the previous implementation sent the
+    # 0-based index and selected the preset one below the one asked for.
+    _get_connection().write(build_select_preset_slot(slot + FIRST_PRESET_SLOT))
+    return {"active": slot, "address": slot_to_address(slot + FIRST_PRESET_SLOT)}
 
 
 @mcp.tool()
 def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
     """Copy a preset from one slot to another.
+
+    Byte-exact: the raw record (name padding, tail and all) is re-slotted
+    and uploaded, so unmodeled data survives the copy.
 
     Args:
         from_slot: Source slot (0-199).
@@ -334,29 +558,29 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
         return {"error": "Slots must be 0-199"}
 
     conn = _get_connection()
-    response = conn.send_and_receive(build_read_preset(from_slot))
-    if response is None:
-        return {"error": "Failed to read source preset"}
+    records = _fetch_all_records()
+    source = records.get(from_slot)
+    if source is None:
+        return {"error": f"Device did not return a record for slot {from_slot}"}
 
-    parsed = parse_preset_response(response)
-    if parsed is None:
-        return {"error": "Failed to parse source preset"}
-
-    # Copy the raw bytes verbatim so unmodeled preset data is preserved
-    data = parsed.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
-    frames = build_store_preset(to_slot, data)
-    conn.send_chunked_and_receive(frames)
-    # Cache independent objects so partial updates to one slot can't
-    # bleed into the other
-    _preset_cache[from_slot] = Preset.from_bytes(data)
-    _preset_cache[to_slot] = Preset.from_bytes(data)
-    name = _preset_cache[to_slot].name
-    return {"copied": True, "from": from_slot, "to": to_slot, "name": name}
+    # The editor's own "save as": select the source so its state is
+    # live, then commit that state to the destination slot.
+    conn.write(build_select_preset_slot(from_slot + FIRST_PRESET_SLOT))
+    time.sleep(0.1)
+    conn.write(build_save_preset(to_slot + FIRST_PRESET_SLOT, source.name))
+    time.sleep(0.15)
+    _record_cache.clear()
+    return {
+        "copied": True,
+        "from": from_slot,
+        "to": to_slot,
+        "name": source.name,
+    }
 
 
 @mcp.tool()
 def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
-    """Swap two preset slots.
+    """Swap two preset slots, byte-exactly.
 
     Args:
         slot_a: First slot (0-199).
@@ -366,29 +590,15 @@ def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
         return {"error": "Slots must be 0-199"}
 
     conn = _get_connection()
+    records = _fetch_all_records()
+    rec_a, rec_b = records.get(slot_a), records.get(slot_b)
+    if rec_a is None or rec_b is None:
+        return {"error": "Device did not return both preset records"}
 
-    # Read both
-    resp_a = conn.send_and_receive(build_read_preset(slot_a))
-    resp_b = conn.send_and_receive(build_read_preset(slot_b))
-    if resp_a is None or resp_b is None:
-        return {"error": "Failed to read one or both presets"}
-
-    parsed_a = parse_preset_response(resp_a)
-    parsed_b = parse_preset_response(resp_b)
-    if parsed_a is None or parsed_b is None:
-        return {"error": "Failed to parse preset data"}
-
-    # Swap the raw bytes verbatim so unmodeled preset data is preserved
-    data_a = parsed_a.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
-    data_b = parsed_b.data[:PRESET_SIZE].ljust(PRESET_SIZE, b"\x00")
-
-    # Write A->B and B->A
-    conn.send_chunked_and_receive(build_store_preset(slot_b, data_a))
-    conn.send_chunked_and_receive(build_store_preset(slot_a, data_b))
-    _preset_cache[slot_a] = Preset.from_bytes(data_b)
-    _preset_cache[slot_b] = Preset.from_bytes(data_a)
-
-    return {"swapped": True, "slot_a": slot_a, "slot_b": slot_b}
+    ok_a = _write_record_live(conn, slot_a + FIRST_PRESET_SLOT, rec_b)
+    time.sleep(0.2)
+    ok_b = _write_record_live(conn, slot_b + FIRST_PRESET_SLOT, rec_a)
+    return {"swapped": ok_a and ok_b, "slot_a": slot_a, "slot_b": slot_b}
 
 
 # ─── EFFECT PARAMETER TOOLS ──────────────────────────────────────────
@@ -396,269 +606,350 @@ def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
 @mcp.tool()
 def set_effect_param(
     module: str,
-    param: str,
+    param_index: int,
     value: int,
 ) -> dict[str, Any]:
-    """Modify a single parameter on the currently active preset in real time.
+    """Modify one parameter of a module on the currently active preset.
+
+    The pedal has no single-parameter write: the editor resends the
+    module's whole block on every change. This reads the active preset's
+    current state, substitutes the one value, and writes the block back.
 
     Args:
-        module: Effect module (fx, od, amp, cab, ns, eq, mod, delay, reverb).
-        param: Parameter name (e.g. 'gain', 'level', 'type').
-        value: Parameter value (0-255, or 0-65535 for delay time).
+        module: Effect module (fx, ds, amp, cab, ns, eq, mod, delay, reverb).
+        param_index: Position of the parameter within the module, 0-9.
+        value: Parameter value, 0-65535.
     """
-    if module not in MODULE_CLASSES:
-        return {"error": f"Unknown module '{module}'. Valid: {list(MODULE_CLASSES)}"}
+    try:
+        command = MODULE_COMMAND_MAP[
+            MODULE_NAME_ALIASES.get(module.lower(), module.lower())
+        ]
+    except KeyError:
+        return {
+            "error": f"Unknown module '{module}'. Valid: {list(MODULE_COMMAND_MAP)}"
+        }
 
-    # Map param name to its byte offset within the module
-    cls = MODULE_CLASSES[module]
-    offsets = cls.param_offsets()
-    if param not in offsets:
-        return {"error": f"Unknown param '{param}' for {module}. Valid: {list(offsets)}"}
+    if not 0 <= param_index < MAX_MODULE_PARAMS:
+        return {
+            "error": f"param_index must be 0-{MAX_MODULE_PARAMS - 1}, "
+                     f"got {param_index}"
+        }
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Value must be 0-65535, got {value}"}
 
-    width = cls.FIELD_WIDTHS.get(param, 1)
-    if width > 2:
-        return {"error": f"Param '{param}' is a multi-byte array; set it via set_preset"}
+    modules = _read_active_modules()
+    if modules is None:
+        return {"error": "Could not read the active preset from the device"}
 
-    max_value = 0xFFFF if width == 2 else 0xFF
-    if not 0 <= value <= max_value:
-        return {"error": f"Value for '{param}' must be 0-{max_value}, got {value}"}
+    block = modules[command]
+    params = list(block.params)
+    params += [0] * (MAX_MODULE_PARAMS - len(params))
+    params[param_index] = value
+    updated = ModuleBlock(
+        enabled=block.enabled, effect_type=block.effect_type, params=params
+    )
 
-    offset = offsets[param]
-    conn = _get_connection()
-    conn.write(build_effect_param(module, offset, value & 0xFF))
-    if width == 2:
-        conn.write(build_effect_param(module, offset + 1, (value >> 8) & 0xFF))
-
-    return {"module": module, "param": param, "value": value}
+    _get_connection().write(build_module_block(module, updated))
+    return {
+        "module": module,
+        "param_index": param_index,
+        "value": value,
+        "effect_type": updated.effect_type,
+        "enabled": updated.enabled,
+    }
 
 
 @mcp.tool()
 def toggle_effect(module: str, enabled: bool) -> dict[str, Any]:
-    """Enable or disable an effect module.
+    """Turn an effect module on or off on the currently active preset.
+
+    Changes the module's ON/OFF status while preserving its effect type
+    and parameters, by reading the active preset and rewriting the block.
 
     Args:
-        module: Effect module name.
-        enabled: True to enable, False to disable.
+        module: Effect module (fx, ds, amp, cab, ns, eq, mod, delay, reverb).
+        enabled: True to turn the module on, False to turn it off.
     """
-    if module not in MODULE_CLASSES:
-        return {"error": f"Unknown module '{module}'. Valid: {list(MODULE_CLASSES)}"}
+    try:
+        command = MODULE_COMMAND_MAP[
+            MODULE_NAME_ALIASES.get(module.lower(), module.lower())
+        ]
+    except KeyError:
+        return {
+            "error": f"Unknown module '{module}'. Valid: {list(MODULE_COMMAND_MAP)}"
+        }
 
-    conn = _get_connection()
-    frame = build_toggle_effect(module, enabled)
-    conn.write(frame)
+    modules = _read_active_modules()
+    if modules is None:
+        return {"error": "Could not read the active preset from the device"}
 
-    return {"module": module, "enabled": enabled}
+    block = modules[command]
+    updated = ModuleBlock(
+        enabled=enabled, effect_type=block.effect_type, params=list(block.params)
+    )
+    _get_connection().write(build_module_block(module, updated))
+
+    return {"module": module, "enabled": enabled, "effect_type": updated.effect_type}
 
 
 @mcp.tool()
 def set_effect_order(order: list[str]) -> dict[str, Any]:
-    """Change the signal chain order.
+    """Not supported: this pedal's effect chain order is fixed.
 
-    Args:
-        order: List of module names in desired order,
-               e.g. ["fx", "od", "amp", "cab", "ns", "eq", "mod", "delay", "reverb"].
+    Every preset carries exactly nine module blocks in the manual's chain
+    order (FX, DS, AMP, CAB, NS, EQ, MOD, DELAY, REVERB) and no captured
+    traffic reorders them.
+
+    This previously sent its byte array under command 0xA5, which is in
+    fact screen brightness -- calling it dimmed the display instead of
+    reordering anything.
     """
-    valid = set(MODULE_CLASSES.keys())
-    for m in order:
-        if m not in valid:
-            return {"error": f"Unknown module '{m}' in order. Valid: {sorted(valid)}"}
-
-    # Build order byte array (maps position -> module index)
-    module_index_map = {name: i for i, name in enumerate(MODULE_NAMES)}
-    order_bytes = bytes([module_index_map.get(m, 0) for m in order])
-    # Pad to 10 bytes
-    order_bytes = order_bytes.ljust(10, b"\x00")
-
-    conn = _get_connection()
-    frame = build_command(Command.PATCH_SETTING, order_bytes)
-    conn.write(frame)
-
-    return {"order": order}
+    return {
+        "error": "The effect chain order is fixed on this pedal.",
+        "chain": list(MODULE_COMMAND_MAP),
+        "requested": order,
+    }
 
 
 # ─── SYSTEM SETTINGS TOOLS ───────────────────────────────────────────
 
 @mcp.tool()
 def get_system_settings() -> dict[str, Any]:
-    """Read global system settings (global EQ, display brightness, auto-off, etc.)."""
-    conn = _get_connection()
-    response = conn.send_and_receive(build_get_system_settings())
-    if response is None:
-        return {"error": "No response from device"}
+    """Not supported: no verified way to read system settings exists.
 
-    parsed = parse_system(response)
-    if parsed is None:
-        return {"error": "Failed to parse system response"}
-
-    settings = SystemSettings.from_bytes(parsed.data)
-    return {"settings": settings.to_dict()}
+    The pedal pushes its settings unsolicited after connect and restore,
+    but no read request has been observed in any capture. Writes ARE
+    supported -- see set_input_level, set_otg_level, set_screen_brightness,
+    set_cab_sim_thru and set_spillover.
+    """
+    return {
+        "error": "Reading system settings is not supported: no read "
+                 "command has been observed on the wire.",
+        "writable_settings": [
+            "set_input_level", "set_otg_level", "set_screen_brightness",
+            "set_cab_sim_thru", "set_spillover",
+        ],
+    }
 
 
 @mcp.tool()
 def set_system_setting(setting: str, value: int) -> dict[str, Any]:
-    """Modify a global system setting.
+    """Not supported: use the specific setting tools instead.
 
-    Args:
-        setting: Setting name/index.
-        value: Setting value.
+    This previously sent a guessed command (0xA1) that has never been
+    observed on the wire. The confirmed settings each have their own
+    tool now.
     """
-    # For now, setting is treated as a numeric index
-    try:
-        setting_index = int(setting)
-    except ValueError:
-        return {"error": f"Setting must be a numeric index, got '{setting}'"}
-
-    conn = _get_connection()
-    frame = build_set_system_setting(setting_index, value)
-    conn.write(frame)
-
-    return {"setting": setting, "value": value}
+    return {
+        "error": f"Refusing to send an unverified command for '{setting}'.",
+        "writable_settings": [
+            "set_input_level", "set_otg_level", "set_screen_brightness",
+            "set_cab_sim_thru", "set_spillover",
+        ],
+    }
 
 
 @mcp.tool()
 def get_volume() -> dict[str, Any]:
-    """Read master volume level."""
-    conn = _get_connection()
-    response = conn.send_and_receive(build_get_volume())
-    if response is None:
-        return {"error": "No response from device"}
+    """Not supported: no volume command has ever been observed.
 
-    parsed = parse_volume(response)
-    if parsed is None:
-        return {"error": "Failed to parse volume response"}
-
-    return {"volume": parsed.volume}
+    The master volume moves in the captures were made on the pedal and
+    produced no USB traffic, so the volume may not sync over USB at all.
+    """
+    return {
+        "error": "No volume command has been observed on the wire; "
+                 "refusing to send a guessed one."
+    }
 
 
 @mcp.tool()
 def set_volume(volume: int) -> dict[str, Any]:
-    """Set master volume level.
+    """Not supported: no volume command has ever been observed.
 
     Args:
-        volume: Volume level (0-100).
+        volume: Ignored.
     """
-    if not 0 <= volume <= 100:
-        return {"error": "Volume must be 0-100"}
-
-    conn = _get_connection()
-    frame = build_set_volume(volume)
-    conn.write(frame)
-
-    return {"volume": volume}
+    return {
+        "error": "No volume command has been observed on the wire; "
+                 "refusing to send a guessed one."
+    }
 
 
 # ─── BACKUP & RESTORE TOOLS ──────────────────────────────────────────
 
 @mcp.tool()
 def backup_all(output_path: str) -> dict[str, Any]:
-    """Download all presets as a .mbf backup file.
+    """Download every preset to a JSON backup file.
+
+    Reads all 200 slots via the confirmed bulk dump and stores each
+    record byte-exactly (hex) alongside its name for readability.
+
+    System settings and CTRL configurations are not yet included.
 
     Args:
         output_path: File path for the backup.
     """
-    conn = _get_connection()
-    presets: list[Preset] = []
-    failed_slots: list[int] = []
+    records = _fetch_all_records()
+    if not records:
+        return {"error": "No response from device"}
 
-    for slot in range(MBF_PRESET_COUNT):
-        response = conn.send_and_receive(build_read_preset(slot))
-        parsed = parse_preset_response(response) if response else None
-        if parsed:
-            presets.append(Preset.from_bytes(parsed.data))
-        else:
-            failed_slots.append(slot)
-            presets.append(Preset())
+    payload = {
+        "format": BACKUP_FORMAT,
+        "version": 1,
+        "presets": [
+            _record_to_file_entry(records[slot]) for slot in sorted(records)
+        ],
+    }
+    path = Path(output_path)
+    path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
-    path = export_mbf(presets, output_path)
-    result: dict[str, Any] = {"path": str(path), "preset_count": len(presets)}
-    if failed_slots:
-        result["failed_slots"] = failed_slots
+    result: dict[str, Any] = {
+        "path": str(path),
+        "preset_count": len(records),
+    }
+    missing = [slot for slot in range(200) if slot not in records]
+    if missing:
+        result["missing_slots"] = missing
         result["warning"] = (
-            f"{len(failed_slots)} slot(s) could not be read and were "
-            "written as empty presets"
+            f"{len(missing)} slot(s) were not returned by the device "
+            "and are absent from the backup"
         )
     return result
 
 
 @mcp.tool()
 def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
-    """Restore presets from a .mbf backup file.
+    """Restore presets from a backup file made by backup_all.
+
+    The pedal REBOOTS when the restore completes (by design -- MOOER
+    Studio's restore does the same); the connection reconnects
+    automatically afterwards.
+
+    Occupied slots are never clobbered by empty backup entries. With
+    ``overwrite=False`` occupied slots are skipped entirely; with
+    ``overwrite=True`` named backup entries replace them.
 
     Args:
-        input_path: Path to the .mbf backup file.
-        overwrite: If True, overwrite existing presets.
+        input_path: Path to the backup JSON file.
+        overwrite: If True, named entries overwrite occupied slots.
     """
-    if not Path(input_path).exists():
+    path = Path(input_path)
+    if not path.exists():
         return {"error": f"File not found: {input_path}"}
 
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"error": f"Could not read backup file: {exc}"}
+    if payload.get("format") != BACKUP_FORMAT:
+        return {
+            "error": "Unrecognized backup format. Only files written by "
+                     "backup_all can be restored."
+        }
+
     conn = _get_connection()
-    presets = import_mbf(input_path)
+    device = _fetch_all_records()
 
-    restored = 0
-    for slot, preset in enumerate(presets):
-        if not overwrite:
-            # Read existing to check if slot is occupied
-            response = conn.send_and_receive(build_read_preset(slot))
-            if response:
-                parsed = parse_preset_response(response)
-                if parsed:
-                    existing = Preset.from_bytes(parsed.data)
-                    if existing.name.strip():
-                        continue
+    to_write = []
+    skipped: list[int] = []
+    for entry in payload.get("presets", []):
+        try:
+            slot = int(entry["slot"])
+            record = _record_from_file_entry(entry, slot)
+        except (KeyError, TypeError, ValueError) as exc:
+            return {"error": f"Malformed backup entry: {exc}"}
+        if not 0 <= slot <= 199:
+            return {"error": f"Backup entry has bad slot {slot}"}
 
-        frames = build_store_preset(slot, preset.to_bytes())
-        conn.send_chunked_and_receive(frames)
-        _preset_cache[slot] = preset
-        restored += 1
+        existing = device.get(slot)
+        occupied = existing is not None and existing.name.strip()
+        if occupied and not record.name.strip():
+            skipped.append(slot)  # never erase a named preset with an empty one
+            continue
+        if occupied and not overwrite:
+            skipped.append(slot)
+            continue
+        to_write.append(record)
 
-    return {"restored": True, "preset_count": restored}
+    acked = _upload_records(conn, to_write) if to_write else 0
+    # RESTORE_END reboots the pedal by design; ride through it.
+    reconnected = conn.reconnect() if to_write else True
+    result: dict[str, Any] = {
+        "restored": True,
+        "preset_count": acked,
+        "reconnected": reconnected,
+    }
+    if skipped:
+        result["skipped_slots"] = sorted(skipped)
+    if acked != len(to_write):
+        result["warning"] = (
+            f"Device acknowledged {acked} of {len(to_write)} writes"
+        )
+    return result
 
 
 @mcp.tool()
 def export_preset(slot: int, output_path: str) -> dict[str, Any]:
-    """Export a single preset to a .mo file.
+    """Export a single preset to a JSON file.
 
     Args:
         slot: Preset slot (0-199).
-        output_path: Output .mo file path.
+        output_path: Output file path.
     """
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
 
-    conn = _get_connection()
-    response = conn.send_and_receive(build_read_preset(slot))
-    if response is None:
-        return {"error": "No response from device"}
+    records = _fetch_all_records(refresh=False)
+    record = records.get(slot)
+    if record is None:
+        return {"error": f"Device did not return a record for slot {slot}"}
 
-    parsed = parse_preset_response(response)
-    if parsed is None:
-        return {"error": "Failed to parse preset response"}
-
-    preset = Preset.from_bytes(parsed.data)
-    path = export_mo(preset, output_path)
-    return {"path": str(path), "name": preset.name}
+    entry = _record_to_file_entry(record)
+    entry["format"] = PRESET_FORMAT
+    entry["version"] = 1
+    path = Path(output_path)
+    path.write_text(json.dumps(entry, indent=1), encoding="utf-8")
+    return {"path": str(path), "name": record.name}
 
 
 @mcp.tool()
 def import_preset(input_path: str, slot: int) -> dict[str, Any]:
-    """Import a preset from a .mo file into a slot.
+    """Import a preset from a file written by export_preset.
 
     Args:
-        input_path: Path to the .mo file.
+        input_path: Path to the preset JSON file.
         slot: Target slot (0-199).
     """
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
-    if not Path(input_path).exists():
+    path = Path(input_path)
+    if not path.exists():
         return {"error": f"File not found: {input_path}"}
 
-    preset = import_mo(input_path)
-    conn = _get_connection()
-    frames = build_store_preset(slot, preset.to_bytes())
-    conn.send_chunked_and_receive(frames)
-    _preset_cache[slot] = preset
+    try:
+        entry = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return {"error": f"Could not read preset file: {exc}"}
+    if entry.get("format") != PRESET_FORMAT:
+        return {
+            "error": "Unrecognized preset format. Only files written by "
+                     "export_preset can be imported."
+        }
 
-    return {"imported": True, "slot": slot, "name": preset.name}
+    try:
+        record = _record_from_file_entry(entry, slot)
+    except (KeyError, TypeError, ValueError) as exc:
+        return {"error": f"Malformed preset file: {exc}"}
+
+    stored = _write_record_live(
+        _get_connection(), slot + FIRST_PRESET_SLOT, record
+    )
+    return {
+        "imported": stored,
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": record.name,
+    }
 
 
 # ─── IR / CABINET TOOLS ──────────────────────────────────────────────
@@ -667,62 +958,436 @@ def import_preset(input_path: str, slot: int) -> dict[str, Any]:
 def list_ir_slots() -> dict[str, Any]:
     """List the user IR slots and their contents."""
     conn = _get_connection()
-    response = conn.send_and_receive(
-        build_command(Command.CAB_MODELS)
-    )
+    response = conn.send_and_expect(build_read_ir_list(), Command.IR_LIST)
     if response is None:
-        return {"error": "No response from device"}
+        return {"error": "No IR list reply from device"}
 
-    # Parse the cab models list — IR slots are typically slots 20+
-    slots = []
-    for i in range(10):
-        slots.append({
-            "slot": i,
-            "name": f"IR Slot {i + 1}",
-            "empty": True,  # Will be populated from device response
-        })
-
-    return {"slots": slots}
+    names = decode_ir_list(response.payload)
+    result = split_user_model_list(names)
+    # Kept for callers of the old flat shape.
+    result["slots"] = [
+        {"slot": i, "name": name, "empty": name == IR_EMPTY_NAME or not name}
+        for i, name in enumerate(names)
+    ]
+    return result
 
 
 @mcp.tool()
-def upload_ir(slot: int, file_path: str, name: str | None = None) -> dict[str, Any]:
-    """Upload a WAV or GNR impulse response to an IR slot.
+def upload_cab(index: int, name: str, blob_hex: str) -> dict[str, Any]:
+    """Upload a user cab (IR) blob to a user cab slot.
+
+    Takes the 1536-byte wire blob as hex -- NOT a .gir or .wav file.
+    MOOER Studio converts files to this blob client-side and that
+    conversion is not yet reverse-engineered, so this tool is for
+    blobs captured from the wire or copied between slots.
 
     Args:
-        slot: IR slot index (0-9).
-        file_path: Path to WAV or GNR file.
-        name: Optional name for the IR.
+        index: User cab slot 0-19 (the pedal displays these as 27-46).
+        name: Cab name, up to 16 ASCII characters.
+        blob_hex: 1536 bytes of blob data, hex-encoded.
     """
-    if not 0 <= slot <= 9:
-        return {"error": "IR slot must be 0-9"}
-
-    path = Path(file_path)
-    if not path.exists():
-        return {"error": f"File not found: {file_path}"}
-
-    data = path.read_bytes()
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except ValueError:
+        return {"error": "blob_hex is not valid hex"}
 
     conn = _get_connection()
+    try:
+        messages = build_upload_cab(index, name, blob)
+    except ValueError as exc:
+        return {"error": str(exc)}
 
-    # For .gnr files, parse and send directly
-    if path.suffix.lower() == ".gnr":
-        header = parse_gnr_header(data)
-        ir_data = data[header["data_offset"]:]
-    else:
-        # For WAV files, send raw data — the device handles conversion
-        ir_data = data
-
-    # Send cabinet upload command with slot and data
-    from .protocol.framing import build_chunked_frames
-    payload = bytes([slot]) + ir_data
-    frames = build_chunked_frames(Command.CABINET_UPLOAD.value, payload)
-    conn.send_chunked_and_receive(frames)
+    for message in messages:
+        for report in message:
+            conn.write(report)
+            time.sleep(WRITE_PACING_SECONDS)
+        reply = None
+        for _ in range(8):
+            reply = conn.read_message()
+            if reply is None or reply.command == Command.UPLOAD_CAB:
+                break
+        if reply is None or reply.command != Command.UPLOAD_CAB:
+            return {"error": "No ack for cab upload message"}
 
     return {
         "uploaded": True,
+        "index": index,
+        "display": index + 27,
+        "name": name[:16],
+    }
+
+
+@mcp.tool()
+def upload_amp(index: int, name: str, blob_hex: str) -> dict[str, Any]:
+    """Upload a user amp model blob to a user amp slot.
+
+    Takes the 10240-byte wire blob as hex -- NOT a .gnr file (see
+    upload_cab for why).
+
+    Args:
+        index: User amp slot 0-19 (the pedal displays these as 56-75).
+        name: Amp name, up to 16 ASCII characters.
+        blob_hex: 10240 bytes of blob data, hex-encoded.
+    """
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except ValueError:
+        return {"error": "blob_hex is not valid hex"}
+
+    conn = _get_connection()
+    try:
+        messages = build_upload_amp(index, name, blob)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    for message in messages:
+        for report in message:
+            conn.write(report)
+            time.sleep(WRITE_PACING_SECONDS)
+        reply = None
+        for _ in range(8):
+            reply = conn.read_message()
+            if reply is None or reply.command == Command.UPLOAD_AMP_ACK:
+                break
+        if reply is None or reply.command != Command.UPLOAD_AMP_ACK:
+            return {"error": "No ack for amp upload message"}
+
+    return {
+        "uploaded": True,
+        "index": index,
+        "display": index + 56,
+        "name": name[:16],
+    }
+
+
+# ─── CAPTURE-DERIVED WRITE TOOLS ──────────────────────────────────────
+
+@mcp.tool()
+def select_preset_slot(slot: int) -> dict[str, Any]:
+    """Make a preset active on the pedal.
+
+    Args:
+        slot: Preset slot 0-199.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    _get_connection().write(build_select_preset_slot(slot + FIRST_PRESET_SLOT))
+    return {
         "slot": slot,
-        "name": name or path.stem,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "selected": True,
+    }
+
+
+@mcp.tool()
+def save_preset(slot: int, name: str) -> dict[str, Any]:
+    """Commit the pedal's current live state to a preset slot.
+
+    This is the pedal's only write. Edit modules first, then save.
+    Saving also sets the name, so this doubles as rename.
+
+    Args:
+        slot: Target preset slot 0-199.
+        name: Preset name, up to 16 ASCII characters.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    _get_connection().write(build_save_preset(slot + FIRST_PRESET_SLOT, name))
+    _record_cache.clear()
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": name[:16],
+        "saved": True,
+    }
+
+
+@mcp.tool()
+def write_preset(
+    slot: int,
+    name: str,
+    modules: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Write a complete preset to a slot, the way the editor does.
+
+    Selects the slot, writes each supplied module block, then saves.
+    Modules left out keep whatever the pedal currently has.
+
+    Args:
+        slot: Target preset slot 0-199.
+        name: Preset name, up to 16 ASCII characters.
+        modules: Per-module state, e.g.
+            {"amp": {"enabled": true, "effect_type": 16, "params": [37, 50]}}.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    blocks: dict[Any, Any] = {}
+    for module_name, state in (modules or {}).items():
+        key = MODULE_NAME_ALIASES.get(module_name.lower(), module_name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return {
+                "error": f"Unknown module '{module_name}'. "
+                         f"Valid: {list(MODULE_COMMAND_MAP)}"
+            }
+        try:
+            blocks[MODULE_COMMAND_MAP[key]] = ModuleBlock(
+                enabled=bool(state.get("enabled", True)),
+                effect_type=int(state.get("effect_type", 0)),
+                params=[int(v) for v in state.get("params", [])],
+            )
+        except (TypeError, ValueError) as exc:
+            return {"error": f"Bad state for module '{module_name}': {exc}"}
+
+    conn = _get_connection()
+    try:
+        reports = build_write_preset(slot + FIRST_PRESET_SLOT, name, blocks)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    for report in reports:
+        conn.write(report)
+        time.sleep(WRITE_PACING_SECONDS)
+
+    _record_cache.clear()
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": name[:16],
+        "modules_written": sorted(
+            n for n, c in MODULE_COMMAND_MAP.items() if c in blocks
+        ),
+        "saved": True,
+    }
+
+
+@mcp.tool()
+def set_expression_target(target: int, enabled: int = 1) -> dict[str, Any]:
+    """Assign what the expression pedal controls.
+
+    The target enumeration is not fully known: the captures show 10 and
+    12 as the editor switched to volume and then to DS. Other values are
+    untested.
+
+    Args:
+        target: Assignment target ID.
+        enabled: Mode/enable flag, normally 1.
+    """
+    try:
+        _get_connection().write(build_set_exp_assign(target, enabled))
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return {"target": target, "enabled": enabled}
+
+
+# ─── SYSTEM SETTINGS (CAPTURE-CONFIRMED) ──────────────────────────────
+
+@mcp.tool()
+def set_input_level(db: float) -> dict[str, Any]:
+    """Set the global input level in decibels.
+
+    Applies to all presets. The manual's range is -inf to +6 dB; the
+    encoding was read off the wire (9 = 0 dB, half a decibel per step).
+
+    Args:
+        db: Level in decibels, e.g. 2.5.
+    """
+    value = db_to_level(db)
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Level {db} dB is out of range"}
+    _get_connection().write(build_set_input_level(value))
+    return {"db": level_to_db(value), "raw": value}
+
+
+@mcp.tool()
+def set_otg_level(db: float) -> dict[str, Any]:
+    """Set the global OTG output level in decibels.
+
+    Args:
+        db: Level in decibels, e.g. 1.0.
+    """
+    value = db_to_level(db)
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Level {db} dB is out of range"}
+    _get_connection().write(build_set_otg_level(value))
+    return {"db": level_to_db(value), "raw": value}
+
+
+@mcp.tool()
+def set_screen_brightness(value: int) -> dict[str, Any]:
+    """Set the pedal's screen brightness. The editor uses 8-17.
+
+    Args:
+        value: Brightness level.
+    """
+    if not 0 <= value <= 0xFFFF:
+        return {"error": f"Brightness must be 0-65535, got {value}"}
+    _get_connection().write(build_set_brightness(value))
+    return {"brightness": value}
+
+
+@mcp.tool()
+def set_cab_sim_thru(left: bool, right: bool) -> dict[str, Any]:
+    """Enable or disable cabinet simulation on each output channel.
+
+    Args:
+        left: Cab sim on the left output.
+        right: Cab sim on the right output.
+    """
+    _get_connection().write(build_set_cab_sim_thru(left, right))
+    return {"left": left, "right": right}
+
+
+@mcp.tool()
+def set_spillover(enabled: bool) -> dict[str, Any]:
+    """Enable or disable delay/reverb spill-over between preset changes.
+
+    Args:
+        enabled: True to let trails ring out across a preset change.
+    """
+    _get_connection().write(build_set_spillover(enabled))
+    return {"spillover": enabled}
+
+
+@mcp.tool()
+def set_global_eq(
+    enabled: bool,
+    low_freq: int = 0, low_gain_db: float = 0.0,
+    mid_freq: int = 0, mid_gain_db: float = 0.0,
+    high_freq: int = 0, high_gain_db: float = 0.0,
+    low_cut: int = 0, high_cut: int = 0,
+) -> dict[str, Any]:
+    """Set the pedal's global EQ (applies across all presets).
+
+    This is the manual's GLOBAL EQ, distinct from any preset's EQ
+    module. The whole block is written on every change, as the editor
+    does. Frequencies are raw wire values; the editor's display runs 30
+    higher for the three band frequencies. Gains are in dB, half-dB
+    steps.
+    """
+    eq = GlobalEQ(
+        enabled=enabled,
+        low_freq=low_freq, low_gain_db=low_gain_db,
+        mid_freq=mid_freq, mid_gain_db=mid_gain_db,
+        high_freq=high_freq, high_gain_db=high_gain_db,
+        low_cut=low_cut, high_cut=high_cut,
+    )
+    try:
+        report = build_set_global_eq(eq)
+    except ValueError as exc:
+        return {"error": str(exc)}
+    _get_connection().write(report)
+    return {"global_eq": eq.__dict__}
+
+
+# ─── CTRL CONFIGURATION ───────────────────────────────────────────────
+
+@mcp.tool()
+def get_ctrl_config(slot: int) -> dict[str, Any]:
+    """Read which modules a preset's footswitch toggles (its CTRL setup).
+
+    Args:
+        slot: Preset slot 0-199.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    conn = _get_connection()
+    response = conn.send_and_expect(
+        build_read_ctrl_config(slot), Command.CTRL_CONFIG
+    )
+    if response is None:
+        return {"error": "No CTRL config reply from device"}
+
+    _, flags = decode_ctrl_config(response.payload)
+    names = {command: name for name, command in MODULE_COMMAND_MAP.items()}
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "toggles": {names[c]: v for c, v in flags.items()},
+    }
+
+
+@mcp.tool()
+def set_ctrl_config(slot: int, modules: list[str]) -> dict[str, Any]:
+    """Choose which modules a preset's footswitch toggles.
+
+    Args:
+        slot: Preset slot 0-199.
+        modules: Module names the footswitch should toggle, e.g.
+            ["delay", "reverb"]. Any not listed are left untouched by it.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    wanted = set()
+    for name in modules:
+        key = MODULE_NAME_ALIASES.get(name.lower(), name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return {
+                "error": f"Unknown module '{name}'. "
+                         f"Valid: {list(MODULE_COMMAND_MAP)}"
+            }
+        wanted.add(MODULE_COMMAND_MAP[key])
+
+    flags = [c in wanted for c in MODULE_CHAIN]
+    _get_connection().write(build_write_ctrl_config(slot, flags))
+    return {"slot": slot, "toggles": sorted(m.lower() for m in modules)}
+
+
+# ─── DIRECT PRESET WRITE ──────────────────────────────────────────────
+
+@mcp.tool()
+def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
+    """Write a complete preset record directly to a slot.
+
+    This is the restore-style write: byte-exact including the tail, but
+    THE PEDAL REBOOTS a moment after (RESTORE_END does that by design,
+    exactly as after MOOER Studio's own restore). Prefer set_preset /
+    write_preset for interactive edits; use this when byte fidelity
+    matters and a reboot is acceptable. The connection reconnects
+    automatically.
+
+    Args:
+        slot: Target preset slot 0-199.
+        preset: A preset as returned by get_preset -- ``name`` plus
+            ``modules``, each with enabled / effect_type / params.
+    """
+    if not 0 <= slot <= 199:
+        return {"error": "Slot must be 0-199"}
+
+    record = PresetRecord(slot=slot + FIRST_PRESET_SLOT)
+    record = record.with_name(str(preset.get("name", "")))
+
+    blocks: dict[Any, Any] = {}
+    for name, state in (preset.get("modules") or {}).items():
+        key = MODULE_NAME_ALIASES.get(name.lower(), name.lower())
+        if key not in MODULE_COMMAND_MAP:
+            return {"error": f"Unknown module '{name}'"}
+        try:
+            blocks[MODULE_COMMAND_MAP[key]] = ModuleBlock(
+                enabled=bool(state.get("enabled", True)),
+                effect_type=int(state.get("effect_type", 0)),
+                params=[int(v) for v in state.get("params", [])],
+            )
+        except (TypeError, ValueError) as exc:
+            return {"error": f"Bad state for module '{name}': {exc}"}
+
+    for command in MODULE_CHAIN:
+        blocks.setdefault(command, ModuleBlock(enabled=False, effect_type=0))
+    record.modules = blocks
+
+    conn = _get_connection()
+    acked = _upload_records(conn, [record])
+    reconnected = conn.reconnect()
+    return {
+        "slot": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "name": record.name,
+        "acknowledged": acked == 1,
+        "reconnected": reconnected,
     }
 
 
@@ -753,11 +1418,15 @@ def resource_device_status() -> str:
 
 @mcp.resource("mooer://presets/list")
 def resource_presets_list() -> str:
-    """Summary list of cached preset names."""
-    presets = []
-    for slot in sorted(_preset_cache.keys()):
-        p = _preset_cache[slot]
-        presets.append({"slot": slot, "name": p.name})
+    """Summary list of preset names from the last bulk dump."""
+    presets = [
+        {
+            "slot": slot,
+            "address": slot_to_address(record.slot),
+            "name": record.name,
+        }
+        for slot, record in sorted(_record_cache.items())
+    ]
     return json.dumps({"presets": presets})
 
 

@@ -1,8 +1,10 @@
 """USB HID connection to the Mooer GE150 Pro Li.
 
 Supports both ``hidapi`` (preferred) and ``pyusb`` backends.
-The device presents as a USB composite device; we communicate on
-Interface 3 (HID) with endpoints 0x81 (IN) and 0x02 (OUT).
+The device presents as a USB composite device (audio + MIDI + HID). The
+editor protocol runs on the HID interface, which the USB configuration
+descriptor in ``log/various_tests.pcapng`` places at interface 5 with
+64-byte interrupt endpoints 0x85 (IN) and 0x05 (OUT).
 """
 
 from __future__ import annotations
@@ -20,12 +22,17 @@ from ..protocol.framing import (
 
 logger = logging.getLogger(__name__)
 
-VENDOR_ID = 0x0483
-PRODUCT_ID = 0x5703
-HID_INTERFACE = 3
-EP_IN = 0x81
-EP_OUT = 0x02
+VENDOR_ID = 0x34DB
+PRODUCT_ID = 0x000F
+HID_INTERFACE = 5
+EP_IN = 0x85
+EP_OUT = 0x05
 READ_TIMEOUT_MS = 1000
+
+#: The IDs this repo targeted before the USB capture. They belong to the
+#: older STM32-based Mooer units (GE200 and relatives), not to this pedal.
+LEGACY_VENDOR_ID = 0x0483
+LEGACY_PRODUCT_ID = 0x5703
 
 
 @dataclass
@@ -172,6 +179,50 @@ class USBConnection:
             self._connected = False
             logger.info("Disconnected")
 
+    def reconnect(self, timeout_s: float = 20.0) -> bool:
+        """Re-open the device after it re-enumerates.
+
+        RESTORE_END (0xBB) makes the pedal reboot and re-enumerate by
+        design -- MOOER Studio's own restore shows the same USB address
+        change. Polls for the device and reopens the same interface.
+        """
+        import hid
+
+        try:
+            if self._device is not None:
+                self._device.close()
+        except Exception:
+            pass
+        self._connected = False
+
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            time.sleep(1.0)
+            try:
+                infos = hid.enumerate(self._vendor_id, self._product_id)
+            except Exception:
+                continue
+            target = next(
+                (i for i in infos
+                 if i.get("interface_number") == HID_INTERFACE),
+                None,
+            )
+            if target is None:
+                continue
+            try:
+                device = hid.device()
+                device.open_path(target["path"])
+                device.set_nonblocking(False)
+            except Exception:
+                continue
+            self._device = device
+            self._backend = "hidapi"
+            self._connected = True
+            logger.info("Reconnected after device re-enumeration")
+            return True
+        logger.warning("Device did not come back within %.0fs", timeout_s)
+        return False
+
     def write(self, data: bytes) -> int:
         """Write a 64-byte HID report to the device.
 
@@ -194,7 +245,12 @@ class USBConnection:
             )
 
         if self._backend == "hidapi":
-            return self._device.write(data)
+            # hidapi requires the first byte of hid_write() to be the
+            # report ID; this device uses unnumbered reports, so it must
+            # be 0x00. Without it the pedal receives reports with the
+            # HID-size byte consumed as a report ID and ignores
+            # everything (verified against real hardware).
+            return self._device.write(b"\x00" + data)
         elif self._backend == "pyusb":
             return self._device.write(EP_OUT, data, timeout=READ_TIMEOUT_MS)
         else:
@@ -283,6 +339,102 @@ class USBConnection:
         """
         self.write(data)
         return self.read_message(timeout_ms)
+
+    def send_and_expect(
+        self,
+        data: bytes,
+        command: int,
+        timeout_ms: int = READ_TIMEOUT_MS,
+        max_skip: int = 32,
+    ) -> Frame | None:
+        """Send a command and return the first reply with *command*.
+
+        The pedal pushes unsolicited state constantly -- expression-pedal
+        position, preset changes, module echoes -- so the next message on
+        the wire is often not the answer to what was just asked. This
+        skips messages until the expected reply arrives.
+
+        Args:
+            data: A 64-byte HID report to send.
+            command: The reply command ID to wait for.
+            timeout_ms: Timeout for each individual report read.
+            max_skip: Give up after this many unrelated messages.
+
+        Returns:
+            The matching Frame, or None on timeout or if too many
+            unrelated messages arrived first.
+        """
+        self.write(data)
+
+        for _ in range(max_skip + 1):
+            frame = self.read_message(timeout_ms)
+            if frame is None:
+                return None
+            if frame.command == command:
+                return frame
+            logger.debug(
+                "Skipping unsolicited 0x%02X while awaiting 0x%02X",
+                frame.command, command,
+            )
+        logger.warning("Gave up waiting for 0x%02X", command)
+        return None
+
+    def send_and_collect(
+        self,
+        data: bytes,
+        count: int,
+        timeout_ms: int = READ_TIMEOUT_MS,
+        command: int | None = None,
+        max_skip: int = 1000,
+    ) -> list[Frame]:
+        """Send a command and collect up to *count* reply messages.
+
+        Some requests answer with a stream rather than a single message --
+        ``DUMP_PRESETS`` returns one record per preset slot. Collection
+        stops early if a read times out, so a short or interrupted stream
+        yields what did arrive rather than raising.
+
+        When *command* is given, only messages with that command count
+        toward *count* and others are skipped. This matters on real
+        hardware: notifications left over from earlier requests sit in
+        the HID buffer ahead of the stream, and counting them as records
+        truncates the collection (observed live: a 200-record dump came
+        back 188 because 12 stale messages were counted).
+
+        Args:
+            data: A 64-byte HID report to send.
+            count: Maximum number of (matching) messages to collect.
+            timeout_ms: Timeout for each individual report read.
+            command: If set, collect only messages with this command ID.
+            max_skip: Give up after skipping this many non-matching
+                messages, so a pedal streaming notifications (e.g. an
+                expression sweep) cannot stall the collector forever.
+
+        Returns:
+            The matching messages received, in order.
+        """
+        self.write(data)
+
+        frames: list[Frame] = []
+        skipped = 0
+        while len(frames) < count:
+            frame = self.read_message(timeout_ms)
+            if frame is None:
+                logger.debug(
+                    "Stream ended after %d of %d messages", len(frames), count
+                )
+                break
+            if command is not None and frame.command != command:
+                skipped += 1
+                if skipped > max_skip:
+                    logger.warning(
+                        "Gave up collecting 0x%02X after %d unrelated "
+                        "messages", command, skipped,
+                    )
+                    break
+                continue
+            frames.append(frame)
+        return frames
 
     def send_chunked_and_receive(
         self,

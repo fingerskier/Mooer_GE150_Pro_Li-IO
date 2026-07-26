@@ -1,6 +1,6 @@
 {
   "name": "mooer-ge150",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Control the Mooer GE150 Pro Li guitar effects pedal over USB — manage all 200 preset slots, tweak effect parameters in real time, backup/restore presets, and upload impulse responses.",
   "author": {
     "name": "Fingerskier",

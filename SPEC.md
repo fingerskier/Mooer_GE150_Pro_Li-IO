@@ -1,5 +1,19 @@
 # Mooer GE150 Pro Li — Communication Protocol & MCP Server Specification
 
+> **Terminology:** see [`GLOSSARY.md`](GLOSSARY.md) for the owner's manual's
+> vocabulary, which this document predates.
+>
+> **Superseded in part by a real USB capture.** Much of this document was
+> written before any traffic from the pedal had been observed. The USB IDs,
+> endpoints, frame checksum and command IDs have since been derived from
+> `log/various_tests.pcapng` and differ from what is described below.
+> **[`log/CAPTURE_ANALYSIS.md`](log/CAPTURE_ANALYSIS.md) is the
+> authoritative source** for transport, framing and command IDs; the
+> sections here that it contradicts are kept for historical context only.
+> Areas the capture does not cover — preset data layout, preset writes,
+> identify, volume, system settings — remain as specified here and are
+> marked *unverified* in the code.
+
 ## Table of Contents
 
 1. [Overview](#overview)
