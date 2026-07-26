@@ -38,7 +38,7 @@ def test_server_imports_and_registers_its_tools():
     import mooer_ge150_mcp.server as real_server
 
     tools = asyncio.run(real_server.mcp.list_tools())
-    assert len(tools) == 34
+    assert len(tools) == 35
     assert "list_ir_slots" in {t.name for t in tools}
 
 
@@ -431,3 +431,60 @@ class TestPutPreset:
         assert "error" in server.put_preset(200, {"name": "x"})
         assert "error" in server.put_preset(0, {"modules": {"nope": {}}})
         assert pedal.uploaded == []
+
+
+class TestUserModelUploads:
+    """Cab/amp uploads, decoded from log/test4.pcapng.
+
+    The wire sessions: cab = 0xB5 begin/name/3x512B chunks, each echoed;
+    amp = 0xD3 [index, seq, 512B] x20 + name message, acked by 0x13.
+    """
+
+    def test_cab_upload_lands_in_a_user_cab_slot(self, wired):
+        server, _, pedal = wired
+        blob = bytes(range(256)) * 6  # 1536 bytes
+        result = server.upload_cab(0, "C-2X12 FENDER DX", blob.hex())
+
+        assert result == {
+            "uploaded": True, "index": 0, "display": 27,
+            "name": "C-2X12 FENDER DX",
+        }
+        assert pedal.ir_names[20] == "C-2X12 FENDER DX"
+        assert pedal.cab_blobs[0] == blob
+
+    def test_amp_upload_lands_in_a_user_amp_slot(self, wired):
+        server, _, pedal = wired
+        blob = bytes([7]) * 10240
+        result = server.upload_amp(0, "E-3RD POWER DRAG", blob.hex())
+
+        assert result["uploaded"] is True
+        assert result["display"] == 56
+        assert pedal.ir_names[0] == "E-3RD POWER DRAG"
+        assert pedal.amp_blobs[0] == blob
+
+    def test_list_shows_the_amp_cab_split(self, wired):
+        server, _, pedal = wired
+        server.upload_amp(0, "E-3RD POWER DRAG", (bytes([1]) * 10240).hex())
+        server.upload_cab(1, "34 CT-BogOS412", (bytes([2]) * 1536).hex())
+
+        listing = server.list_ir_slots()
+        amps = {a["display"]: a["name"] for a in listing["amps"] if not a["empty"]}
+        cabs = {c["display"]: c["name"] for c in listing["cabs"] if not c["empty"]}
+        assert amps == {56: "E-3RD POWER DRAG"}
+        assert cabs == {28: "34 CT-BogOS412"}
+
+    def test_wrong_blob_size_is_rejected_before_sending(self, wired):
+        server, _, pedal = wired
+        assert "error" in server.upload_cab(0, "X", "00" * 100)
+        assert "error" in server.upload_amp(0, "X", "00" * 100)
+        assert pedal.cab_blobs == {}
+        assert pedal.amp_blobs == {}
+
+    def test_bad_hex_is_rejected(self, wired):
+        server, _, _ = wired
+        assert "error" in server.upload_cab(0, "X", "zz")
+
+    def test_out_of_range_index_rejected(self, wired):
+        server, _, _ = wired
+        assert "error" in server.upload_cab(20, "X", "00" * 1536)
+        assert "error" in server.upload_amp(20, "X", "00" * 10240)

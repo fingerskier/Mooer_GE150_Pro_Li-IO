@@ -49,6 +49,11 @@ from .protocol.commands import (
     PresetRecord,
     slot_to_address,
     IR_EMPTY_NAME,
+    AMP_BLOB_SIZE,
+    CAB_BLOB_SIZE,
+    build_upload_amp,
+    build_upload_cab,
+    split_user_model_list,
     MAX_MODULE_PARAMS,
     MODULE_NAME_ALIASES,
     ModuleBlock,
@@ -898,30 +903,90 @@ def list_ir_slots() -> dict[str, Any]:
         return {"error": "No IR list reply from device"}
 
     names = decode_ir_list(response.payload)
-    slots = [
+    result = split_user_model_list(names)
+    # Kept for callers of the old flat shape.
+    result["slots"] = [
         {"slot": i, "name": name, "empty": name == IR_EMPTY_NAME or not name}
         for i, name in enumerate(names)
     ]
-    return {"slots": slots}
+    return result
 
 
 @mcp.tool()
-def upload_ir(slot: int, file_path: str, name: str | None = None) -> dict[str, Any]:
-    """Not supported yet: the IR upload protocol has not been captured.
+def upload_cab(index: int, name: str, blob_hex: str) -> dict[str, Any]:
+    """Upload a user cab (IR) blob to a user cab slot.
 
-    This previously sent a guessed command (0xE1) with raw file bytes.
-    Since guessed commands can collide with real ones, it now refuses.
-    Capture MOOER Studio performing an IR upload to unlock this.
+    Takes the 1536-byte wire blob as hex -- NOT a .gir or .wav file.
+    MOOER Studio converts files to this blob client-side and that
+    conversion is not yet reverse-engineered, so this tool is for
+    blobs captured from the wire or copied between slots.
 
     Args:
-        slot: Ignored.
-        file_path: Ignored.
-        name: Ignored.
+        index: User cab slot 0-19 (the pedal displays these as 27-46).
+        name: Cab name, up to 16 ASCII characters.
+        blob_hex: 1536 bytes of blob data, hex-encoded.
     """
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except ValueError:
+        return {"error": "blob_hex is not valid hex"}
+
+    conn = _get_connection()
+    try:
+        messages = build_upload_cab(index, name, blob)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    for message in messages:
+        for report in message:
+            conn.write(report)
+        reply = conn.read_message()
+        if reply is None or reply.command != Command.UPLOAD_CAB:
+            return {"error": "No ack for cab upload message"}
+
     return {
-        "error": "IR upload is not yet reverse-engineered; refusing to "
-                 "send a guessed command. Capture MOOER Studio uploading "
-                 "an IR and this can be implemented."
+        "uploaded": True,
+        "index": index,
+        "display": index + 27,
+        "name": name[:16],
+    }
+
+
+@mcp.tool()
+def upload_amp(index: int, name: str, blob_hex: str) -> dict[str, Any]:
+    """Upload a user amp model blob to a user amp slot.
+
+    Takes the 10240-byte wire blob as hex -- NOT a .gnr file (see
+    upload_cab for why).
+
+    Args:
+        index: User amp slot 0-19 (the pedal displays these as 56-75).
+        name: Amp name, up to 16 ASCII characters.
+        blob_hex: 10240 bytes of blob data, hex-encoded.
+    """
+    try:
+        blob = bytes.fromhex(blob_hex)
+    except ValueError:
+        return {"error": "blob_hex is not valid hex"}
+
+    conn = _get_connection()
+    try:
+        messages = build_upload_amp(index, name, blob)
+    except ValueError as exc:
+        return {"error": str(exc)}
+
+    for message in messages:
+        for report in message:
+            conn.write(report)
+        reply = conn.read_message()
+        if reply is None or reply.command != Command.UPLOAD_AMP_ACK:
+            return {"error": "No ack for amp upload message"}
+
+    return {
+        "uploaded": True,
+        "index": index,
+        "display": index + 56,
+        "name": name[:16],
     }
 
 

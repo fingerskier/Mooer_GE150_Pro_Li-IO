@@ -84,6 +84,10 @@ class FakeMaxPedal:
         self.saves: list[tuple[int, bytes]] = []
         self.uploaded: list[int] = []
         self.restore_brackets: list[str] = []
+        self.cab_blobs: dict[int, bytes] = {}
+        self.amp_blobs: dict[int, bytes] = {}
+        self._cab_upload: dict = {}
+        self._amp_upload: dict = {}
         self.settings: dict[Command, list[int]] = {}
         self.ctrl_flags: list[list[bool]] = [
             [False] * len(MODULE_CHAIN) for _ in range(NUM_SLOTS)
@@ -193,6 +197,36 @@ class FakeMaxPedal:
                 )
                 self.saves.append((slot, name))
             self._respond(Command.PRESET_NAME_NOTIFY, payload)
+
+        elif command == Command.UPLOAD_CAB:
+            seq = payload[0]
+            if seq == 0x00:
+                self._cab_upload = {
+                    "index": int.from_bytes(payload[1:3], "little"),
+                    "name": b"", "data": b"",
+                }
+            elif seq == 0x01:
+                self._cab_upload["name"] = payload[1:]
+            else:
+                self._cab_upload["data"] += payload[1:]
+                if len(self._cab_upload["data"]) >= 1536:
+                    up = self._cab_upload
+                    name = up["name"].split(b"\x00")[0].decode("ascii")
+                    self.ir_names[20 + up["index"]] = name
+                    self.cab_blobs[up["index"]] = up["data"]
+            self._respond(Command.UPLOAD_CAB, bytes([seq]))
+
+        elif command == Command.UPLOAD_AMP:
+            index, seq = payload[0], payload[1]
+            if seq == 0:
+                self._amp_upload = {"index": index, "data": b""}
+            if len(payload) == 2 + 16 and seq == 20:
+                name = payload[2:].split(b"\x00")[0].decode("ascii")
+                self.ir_names[index] = name
+                self.amp_blobs[index] = self._amp_upload["data"]
+            else:
+                self._amp_upload["data"] += payload[2:]
+            self._respond(Command.UPLOAD_AMP_ACK, bytes([index, seq]))
 
         elif command == Command.RESTORE_BEGIN:
             self.restore_brackets.append("begin")

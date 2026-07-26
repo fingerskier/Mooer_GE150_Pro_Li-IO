@@ -54,7 +54,22 @@ class Command(IntEnum):
     DUMP_PRESETS = 0xA0  # confirmed: replies with 200x 0x20 records
     PRESET_RECORD = 0x20  # confirmed: 245-byte preset record
     READ_IR_LIST = 0xC1  # confirmed: replies 0x41, 40x 16-byte names
+    # 0x41 is the USER MODEL LIST: indices 0-19 are user amp slots,
+    # 20-39 user cab slots. Confirmed in test4.pcapng -- an uploaded amp
+    # landed at index 0 (displayed 56 = 55 factory amps + 1) and cabs at
+    # indices 20/21 (displayed 27/28 = 26 factory cabs + 1/2).
     IR_LIST = 0x41
+
+    # --- user model uploads (test4.pcapng) --------------------------------
+    # Cab: a 0xB5 session -- [00, cab_index u16 LE, 01] begin, [01, 16-byte
+    # name], then [02+i, 512-byte chunk] x3 (1536-byte blob). The pedal
+    # echoes each sequence byte back as 0xB5.
+    UPLOAD_CAB = 0xB5
+    # Amp: 0xD3 chunks [amp_index, seq, 512 bytes] x20 (10240-byte blob),
+    # then [amp_index, 20, 16-byte name] to finish. Acked by 0x13 echoing
+    # [amp_index, seq]. After the final ack the pedal pushes a fresh 0x41.
+    UPLOAD_AMP = 0xD3
+    UPLOAD_AMP_ACK = 0x13
     READ_STATE_8C = 0x8C  # confirmed: replies 0x0C, 6 bytes
     READ_ACTIVE = 0xB0  # confirmed: replies 0x30, active preset state
     ACTIVE_STATE = 0x30
@@ -698,3 +713,119 @@ def build_restore_begin() -> bytes:
 def build_restore_end() -> bytes:
     """Close a restore."""
     return build_command(Command.RESTORE_END, b"\x01")
+
+
+# ---------------------------------------------------------------------------
+# User model uploads (cabs and amps)
+#
+# Decoded from log/test4.pcapng: MOOER Studio uploading a .gir cab, a
+# .wav cab (converted client-side to the same wire blob) and a .gnr amp.
+# A failed amp upload produced no traffic at all, so file validation is
+# client-side.
+# ---------------------------------------------------------------------------
+
+#: The 0x41 user model list: amp slots then cab slots.
+USER_AMP_SLOTS = 20
+USER_CAB_SLOTS = 20
+USER_CAB_LIST_BASE = USER_AMP_SLOTS  # cabs start at index 20
+
+#: Display numbering offsets, confirmed by the editor's own labels:
+#: user amp index 0 shows as 56 (55 factory amps), user cab index 0 as
+#: 27 (26 factory cabs).
+FACTORY_AMP_COUNT = 55
+FACTORY_CAB_COUNT = 26
+
+#: Wire blob sizes. Both cab uploads were exactly 3 x 512 bytes and the
+#: amp exactly 20 x 512.
+UPLOAD_CHUNK_SIZE = 512
+CAB_BLOB_SIZE = 3 * UPLOAD_CHUNK_SIZE
+AMP_BLOB_SIZE = 20 * UPLOAD_CHUNK_SIZE
+
+
+def _upload_name(name: str) -> bytes:
+    encoded = name.encode("ascii", errors="replace")[:PRESET_NAME_LENGTH]
+    return encoded.ljust(PRESET_NAME_LENGTH, b"\x00")
+
+
+def build_upload_cab(index: int, name: str, blob: bytes) -> list[list[bytes]]:
+    """Build the message sequence that uploads a user cab.
+
+    Args:
+        index: User cab slot 0-19 (displays as 27-46 on the pedal).
+        name: Cab name, up to 16 ASCII characters.
+        blob: The 1536-byte wire blob. This is NOT the .gir/.wav file --
+            MOOER Studio converts files to this form client-side and the
+            conversion is not yet reverse-engineered.
+
+    Returns:
+        One list of HID reports per message. Send each message's reports,
+        then wait for the pedal to echo the sequence byte as 0xB5 before
+        sending the next message.
+    """
+    if not 0 <= index < USER_CAB_SLOTS:
+        raise ValueError(f"User cab index must be 0-{USER_CAB_SLOTS - 1}, got {index}")
+    if len(blob) != CAB_BLOB_SIZE:
+        raise ValueError(f"Cab blob must be {CAB_BLOB_SIZE} bytes, got {len(blob)}")
+
+    messages = [
+        bytes([0x00]) + index.to_bytes(2, "little") + b"\x01",
+        bytes([0x01]) + _upload_name(name),
+    ]
+    for i in range(0, CAB_BLOB_SIZE, UPLOAD_CHUNK_SIZE):
+        seq = 0x02 + i // UPLOAD_CHUNK_SIZE
+        messages.append(bytes([seq]) + blob[i : i + UPLOAD_CHUNK_SIZE])
+
+    return [build_chunked_frames(Command.UPLOAD_CAB, m) for m in messages]
+
+
+def build_upload_amp(index: int, name: str, blob: bytes) -> list[list[bytes]]:
+    """Build the message sequence that uploads a user amp model.
+
+    Args:
+        index: User amp slot 0-19 (displays as 56-75 on the pedal).
+        name: Amp name, up to 16 ASCII characters.
+        blob: The 10240-byte wire blob (as with cabs, not the .gnr file).
+
+    Returns:
+        One list of HID reports per message. Each message is acked by
+        0x13 echoing [index, seq]; wait for it before the next message.
+    """
+    if not 0 <= index < USER_AMP_SLOTS:
+        raise ValueError(f"User amp index must be 0-{USER_AMP_SLOTS - 1}, got {index}")
+    if len(blob) != AMP_BLOB_SIZE:
+        raise ValueError(f"Amp blob must be {AMP_BLOB_SIZE} bytes, got {len(blob)}")
+
+    messages = []
+    n_chunks = AMP_BLOB_SIZE // UPLOAD_CHUNK_SIZE
+    for seq in range(n_chunks):
+        start = seq * UPLOAD_CHUNK_SIZE
+        messages.append(
+            bytes([index, seq]) + blob[start : start + UPLOAD_CHUNK_SIZE]
+        )
+    messages.append(bytes([index, n_chunks]) + _upload_name(name))
+
+    return [build_chunked_frames(Command.UPLOAD_AMP, m) for m in messages]
+
+
+def split_user_model_list(names: list[str]) -> dict[str, list[dict]]:
+    """Split the 40-entry 0x41 list into amp and cab slots with the
+    display numbers the pedal shows."""
+    amps = [
+        {
+            "index": i,
+            "display": FACTORY_AMP_COUNT + 1 + i,
+            "name": names[i],
+            "empty": names[i] in ("", IR_EMPTY_NAME),
+        }
+        for i in range(USER_AMP_SLOTS)
+    ]
+    cabs = [
+        {
+            "index": i,
+            "display": FACTORY_CAB_COUNT + 1 + i,
+            "name": names[USER_CAB_LIST_BASE + i],
+            "empty": names[USER_CAB_LIST_BASE + i] in ("", IR_EMPTY_NAME),
+        }
+        for i in range(USER_CAB_SLOTS)
+    ]
+    return {"amps": amps, "cabs": cabs}
