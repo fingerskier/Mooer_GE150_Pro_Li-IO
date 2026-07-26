@@ -27,7 +27,8 @@ def test_command_enum_values():
     assert Command.FX == 0x82
     assert Command.AMP == 0x84
     assert Command.CAB == 0x85
-    assert Command.REVERB == 0x89
+    assert Command.DELAY == 0x89
+    assert Command.REVERB == 0x8A
     assert Command.READ_PRESET == 0x96
     assert Command.PRESET_NAME == 0x97
     assert Command.SETTING_A6 == 0xA6

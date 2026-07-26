@@ -44,13 +44,13 @@ MESSAGES: list[tuple[int, str, str]] = [
     # frame 5627: cab module block
     (0x85, "010008000200000005003700120000000000000000000000",
      "aa55190085010008000200000005003700120000000000000000000000aa39"),
-    # frame 7847: module block
+    # frame 7847: NS module block
     (0x86, "010002003200320032000000000000000000000000000000",
      "aa55190086010002003200320032000000000000000000000000000000bc65"),
-    # frame 10295: delay module block
+    # frame 10295: MOD module block
     (0x88, "00000a000d0028001c003200c80078003200000000000000",
      "aa5519008800000a000d0028001c003200c800780032000000000000002411"),
-    # frame 10849: reverb module block
+    # frame 10849: DELAY module block (note the 1040 ms times)
     (0x89, "000003003200320010040100100401003200000000000000",
      "aa5519008900000300320032001004010010040100320000000000000005f7"),
     # frame 17837: read preset
@@ -75,7 +75,7 @@ MESSAGES: list[tuple[int, str, str]] = [
     # frame 4061: cab block echoed back after an amp change
     (0x05, "010008000300000005003700120000000000000000000000",
      "aa5519000501000800030000000500370012000000000000000000000041aa"),
-    # frame 11343: reverb block echoed back
+    # frame 11343: delay block echoed back
     (0x09, "0000030012004c000a050600100401003200000000000000",
      "aa551900090000030012004c000a050600100401003200000000000000ac59"),
     # frame 17851 / 17853: preset read replies
@@ -144,12 +144,12 @@ def test_response_command_clears_the_request_bit():
     0x89 -> 0x09 (frames 10849/11343), 0xB4 -> 0x34 (frames 2089/2091).
     """
     assert response_command(Command.CAB) == 0x05
-    assert response_command(Command.REVERB) == 0x09
+    assert response_command(Command.DELAY) == 0x09
     assert response_command(Command.POLL) == 0x34
 
 
 class TestModuleBlock:
-    """The 0x82-0x89 module blocks are 12 little-endian u16 words."""
+    """The 0x82-0x8A module blocks are 12 little-endian u16 words."""
 
     def test_decode_amp_block_from_capture(self):
         """Frame 4059: amp enabled, model 17, six parameters."""
