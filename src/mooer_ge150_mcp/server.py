@@ -148,7 +148,10 @@ def _fetch_all_records(refresh: bool = True) -> dict[int, Any]:
         return _record_cache
 
     conn = _get_connection()
-    frames = conn.send_and_collect(build_dump_presets(), LAST_PRESET_SLOT)
+    frames = conn.send_and_collect(
+        build_dump_presets(), LAST_PRESET_SLOT,
+        command=Command.PRESET_RECORD,
+    )
 
     records: dict[int, Any] = {}
     for frame in frames:

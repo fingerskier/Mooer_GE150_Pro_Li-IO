@@ -95,7 +95,15 @@ class FakeMaxPedal:
     # ── hid.device interface ─────────────────────────────────────────
 
     def write(self, data: bytes) -> int:
-        assert len(data) == HID_REPORT_SIZE, f"report must be 64B, got {len(data)}"
+        data = bytes(data)
+        # hidapi semantics: the first byte of hid_write() is the report
+        # ID, 0x00 for unnumbered reports. Real hardware ignores writes
+        # without it, so the fake requires it too.
+        assert len(data) == HID_REPORT_SIZE + 1, (
+            f"hid_write takes report-ID + 64 bytes, got {len(data)}"
+        )
+        assert data[0] == 0x00, "report ID must be 0x00 (unnumbered reports)"
+        data = data[1:]
         chunk = data[0]
         self._rx_buffer += bytes(data[1 : 1 + chunk])
 

@@ -201,7 +201,12 @@ class USBConnection:
             )
 
         if self._backend == "hidapi":
-            return self._device.write(data)
+            # hidapi requires the first byte of hid_write() to be the
+            # report ID; this device uses unnumbered reports, so it must
+            # be 0x00. Without it the pedal receives reports with the
+            # HID-size byte consumed as a report ID and ignores
+            # everything (verified against real hardware).
+            return self._device.write(b"\x00" + data)
         elif self._backend == "pyusb":
             return self._device.write(EP_OUT, data, timeout=READ_TIMEOUT_MS)
         else:
@@ -335,6 +340,8 @@ class USBConnection:
         data: bytes,
         count: int,
         timeout_ms: int = READ_TIMEOUT_MS,
+        command: int | None = None,
+        max_skip: int = 1000,
     ) -> list[Frame]:
         """Send a command and collect up to *count* reply messages.
 
@@ -343,17 +350,29 @@ class USBConnection:
         stops early if a read times out, so a short or interrupted stream
         yields what did arrive rather than raising.
 
+        When *command* is given, only messages with that command count
+        toward *count* and others are skipped. This matters on real
+        hardware: notifications left over from earlier requests sit in
+        the HID buffer ahead of the stream, and counting them as records
+        truncates the collection (observed live: a 200-record dump came
+        back 188 because 12 stale messages were counted).
+
         Args:
             data: A 64-byte HID report to send.
-            count: Maximum number of messages to collect.
+            count: Maximum number of (matching) messages to collect.
             timeout_ms: Timeout for each individual report read.
+            command: If set, collect only messages with this command ID.
+            max_skip: Give up after skipping this many non-matching
+                messages, so a pedal streaming notifications (e.g. an
+                expression sweep) cannot stall the collector forever.
 
         Returns:
-            The messages received, in order.
+            The matching messages received, in order.
         """
         self.write(data)
 
         frames: list[Frame] = []
+        skipped = 0
         while len(frames) < count:
             frame = self.read_message(timeout_ms)
             if frame is None:
@@ -361,6 +380,15 @@ class USBConnection:
                     "Stream ended after %d of %d messages", len(frames), count
                 )
                 break
+            if command is not None and frame.command != command:
+                skipped += 1
+                if skipped > max_skip:
+                    logger.warning(
+                        "Gave up collecting 0x%02X after %d unrelated "
+                        "messages", command, skipped,
+                    )
+                    break
+                continue
             frames.append(frame)
         return frames
 

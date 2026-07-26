@@ -96,6 +96,16 @@ class TestPresetListing:
         result = server.list_presets(10, 12)
         assert [p["slot"] for p in result["presets"]] == [10, 11, 12]
 
+    def test_stale_notifications_do_not_truncate_the_dump(self, wired):
+        """Observed live: leftover notifications in the HID buffer were
+        counted as records and a 200-preset dump came back as 188."""
+        server, _, pedal = wired
+        for _ in range(12):
+            pedal._respond(Command.PRESET_CHANGED, b"")
+
+        result = server.list_presets()
+        assert result["received"] == 200
+
     def test_bad_range_rejected(self, wired):
         server, _, _ = wired
         assert "error" in server.list_presets(0, 200)
