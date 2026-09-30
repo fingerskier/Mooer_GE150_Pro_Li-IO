@@ -43,6 +43,8 @@ def test_server_imports_and_registers_its_tools():
     tools = asyncio.run(real_server.mcp.list_tools())
     assert len(tools) == 24
     assert "list_user_models" in {t.name for t in tools}
+    # The prompts became the plugin's tone and organize skills.
+    assert asyncio.run(real_server.mcp.list_prompts()) == []
 
 
 def test_every_tool_says_whether_it_changes_the_pedal():
@@ -626,16 +628,10 @@ class TestUserModelUploads:
         assert "error" in server.upload_amp(20, "X", "00" * 10240)
 
 
-class TestOptimizePresetPrompt:
-    """The prompt used to say "set_effect_param, then set_preset to save",
-    which rewrote the slot from its stored copy and lost the edits."""
-
-    def test_prescribes_select_edit_save(self, wired):
-        server, _, _ = wired
-        text = server.optimize_preset("1D", "more clarity")
-        assert "select_preset preset=1D" in text
-        assert "save_preset preset=1D" in text
-        assert "then set_preset to save" not in text
+class TestLiveEditWorkflow:
+    """select -> edit live -> save, the method the tone skill prescribes.
+    (Saving with set_preset instead would rewrite the preset from its
+    stored copy and lose the edits.)"""
 
     def test_the_prescribed_workflow_keeps_the_edit(self, wired):
         server, _, pedal = wired
@@ -890,3 +886,19 @@ class TestFilesAreNotSilentlyReplaced:
         assert "error" in server.export_preset("1A", str(path))
         assert path.read_text() == "keep"
         assert "error" not in server.export_preset("1A", str(path), overwrite=True)
+
+
+class TestFileLocations:
+    def test_backup_creates_missing_folders(self, wired, tmp_path):
+        """The skills back up into the plugin's data directory, whose
+        backups/ folder does not exist the first time."""
+        server, _, _ = wired
+        path = tmp_path / "data" / "backups" / "first.json"
+        assert server.backup_all(str(path))["preset_count"] == 200
+        assert path.exists()
+
+    def test_export_creates_missing_folders(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "exports" / "5a.json"
+        assert "error" not in server.export_preset("5A", str(path))
+        assert path.exists()
