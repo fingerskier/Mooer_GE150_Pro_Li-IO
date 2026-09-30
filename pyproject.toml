@@ -4,13 +4,15 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mooer-ge150-mcp"
-version = "0.2.0"
+version = "0.2.1"
 description = "MCP server for Mooer GE150 Pro Li guitar effects pedal"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
-    "mcp>=1.0.0",
+    # 2.x removed mcp.server.fastmcp, and 1.8-1.12 fail at import on the
+    # tool signatures here; 1.16 is the oldest release checked to work.
+    "mcp>=1.16.0,<2",
     "hidapi>=0.14.0",
 ]
 
@@ -30,3 +32,9 @@ packages = ["src/mooer_ge150_mcp"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+
+[tool.uv]
+# The launcher runs `uvx --from <this directory>`, which caches its build
+# and by default rebuilds only when pyproject.toml changes -- so edits to
+# the source were silently ignored. Rebuild when the source changes too.
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }]

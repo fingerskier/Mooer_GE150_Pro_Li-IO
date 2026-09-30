@@ -4,48 +4,60 @@ MCP server for programmatic control of the Mooer GE150 Pro Li guitar effects ped
 
 ## Quick Start
 
-### Run via npx (no install required)
+You need [Node.js](https://nodejs.org) and [`uv`](https://docs.astral.sh/uv/)
+on your `PATH`:
 
 ```bash
-npx mooer-ge150-mcp
+curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-This requires **one** of the following on your `PATH`:
+The launcher in `bin/` uses `uv` to run the bundled Python server with its
+dependencies. Nothing is installed globally.
 
-| Tool | Install |
-|------|---------|
-| `uvx` (recommended) | `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
-| `pipx` | `python3 -m pip install --user pipx` |
-| `python3` with the package already installed | `pip install mooer-ge150-mcp` |
+### Claude Code (plugin)
 
-### Claude Desktop configuration
+```
+/plugin marketplace add fingerskier/claude-plugins
+/plugin install mooer-ge150@fingerskier-plugins
+```
 
-Add this to your `claude_desktop_config.json`:
+### Claude Desktop and other MCP clients
+
+Clone this repository and point the client at the launcher:
 
 ```json
 {
   "mcpServers": {
     "mooer-ge150": {
-      "command": "npx",
-      "args": ["-y", "mooer-ge150-mcp"]
+      "command": "node",
+      "args": ["/path/to/Mooer_GE150_Pro_Li-IO/bin/mooer-ge150-mcp.mjs"]
     }
   }
 }
 ```
 
-### Install from PyPI
+### Linux: USB permissions
+
+Without a udev rule the pedal can only be opened as root:
 
 ```bash
-pip install mooer-ge150-mcp
-mooer-ge150-mcp
+sudo cp udev/70-mooer-ge150.rules /etc/udev/rules.d/
+sudo udevadm control --reload && sudo udevadm trigger
 ```
 
-### Run from source
+### Working on this repo
+
+Opening the repo in Claude Code starts the server from your checkout, via
+the root `.mcp.json`. Source edits take effect the next time it starts.
+
+To run the server by hand:
 
 ```bash
-pip install -e .
-mooer-ge150-mcp
+node bin/mooer-ge150-mcp.mjs
 ```
+
+> The package is not on npm or PyPI yet, so `npx mooer-ge150-mcp` and
+> `pip install mooer-ge150-mcp` do not work. See [Publishing](#publishing).
 
 ## Features
 
