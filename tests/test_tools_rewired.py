@@ -459,6 +459,17 @@ class TestPutPreset:
         server.put_preset(4, {"name": "No Tail", "modules": {}})
         assert pedal.records[5].tail == b"\xAB" * 12
 
+    def test_kept_tail_is_read_fresh_not_from_the_cache(self, wired):
+        """A cached dump may predate an edit made on the pedal itself;
+        its tail must not be written back as if it were current."""
+        server, _, pedal = wired
+        server.list_presets(0, 9)  # fills the dump cache
+        pedal.records[5].tail = b"\xCD" * 12  # changed on the pedal since
+
+        server.put_preset(4, {"name": "Fresh", "modules": {}})
+
+        assert pedal.records[5].tail == b"\xCD" * 12
+
     def test_rejects_a_malformed_tail(self, wired):
         server, _, pedal = wired
         assert "error" in server.put_preset(4, {"name": "x", "tail": "zz"})
@@ -737,10 +748,39 @@ class TestRebootReconnect:
         """After a reboot the pedal pushes its whole state; a write that
         landed was reported unacknowledged behind it."""
         server, _, pedal = wired
-        server._fetch_all_records()  # tail lookup must not flush the queue
         for command in MODULE_CHAIN + MODULE_CHAIN:
             pedal._respond(command & 0x7F, bytes(24))
 
-        result = server.put_preset(4, {"name": "Landed", "modules": {}})
+        # An explicit tail means no dump runs first to flush the queue.
+        result = server.put_preset(
+            4, {"name": "Landed", "modules": {}, "tail": "00" * 12}
+        )
 
         assert result["acknowledged"] is True
+
+
+class TestDumpCacheLifetime:
+    """The dump cache describes one connected pedal; it must not outlive
+    the connection."""
+
+    def test_disconnect_drops_the_cache(self, wired):
+        server, conn, _ = wired
+        server._connection = conn
+        server.list_presets(0, 9)
+        assert server._record_cache
+
+        server.disconnect()
+
+        assert server._record_cache == {}
+
+    def test_connect_starts_with_an_empty_cache(self, wired):
+        server, conn, _ = wired
+        server.list_presets(0, 9)
+        assert server._record_cache
+
+        with patch.object(server, "USBConnection", return_value=conn), \
+                patch.object(conn, "open", return_value=conn.device_info):
+            server._connection = None
+            server.connect()
+
+        assert server._record_cache == {}

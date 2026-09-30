@@ -474,6 +474,8 @@ def connect() -> dict[str, Any]:
             "model": _connection.device_info.product,
         }
 
+    # The dump cache describes whichever pedal was connected before.
+    _record_cache.clear()
     _connection = USBConnection()
     try:
         info = _connection.open()
@@ -507,6 +509,7 @@ def connect() -> dict[str, Any]:
 def disconnect() -> dict[str, bool]:
     """Close the USB connection to the pedal."""
     global _connection
+    _record_cache.clear()
     if _connection is None:
         return {"disconnected": True}
     _connection.close()
@@ -1616,7 +1619,9 @@ def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
                          f"got {len(tail)}"
             }
     else:
-        existing = _fetch_all_records(refresh=False).get(slot)
+        # Always a fresh read. A cached record may predate an edit made
+        # on the pedal, and its tail would go out as if it were current.
+        existing = _fetch_all_records().get(slot)
         if existing is None:
             return {
                 "error": f"Device did not return a record for slot {slot}, "
