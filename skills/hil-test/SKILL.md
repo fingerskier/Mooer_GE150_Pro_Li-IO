@@ -16,7 +16,9 @@ its four presets: for bank 5, `5A`–`5D`. If no bank was given, ask for one.
 Confirm all of these with the user and wait for a yes:
 
 - The four presets in bank N may be overwritten during the test. They are
-  restored at the end.
+  restored at the end, so all four must have names: `restore_backup`
+  never writes an empty preset over a named one, and an empty slot the
+  test fills could not be emptied again.
 - The pedal is connected and powered, and MOOER Studio is closed.
 - The pedal will reboot four times, silencing it for about 10 s each time.
 
@@ -34,6 +36,8 @@ Confirm all of these with the user and wait for a yes:
 report `preset_count: 200` and no `missing_slots`. Then save the bank on
 its own:
 `python3 ${CLAUDE_SKILL_DIR}/backups.py subset <before file> <…-hil-bank.json> $bank`.
+If it refuses because the bank has an empty preset, stop before writing
+anything and ask for another bank.
 
 **1. Reads.**
 - `get_device_info` reports GE150Max and the active preset.

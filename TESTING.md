@@ -51,7 +51,9 @@ below are the same procedure, for running by hand.
 * The MCP server connected (in this repo, Claude Code starts it from
   `.mcp.json`), or a Python script using `mooer_ge150_mcp.server`.
 * A **scratch bank** whose presets may be overwritten. The examples use
-  5A–5D.
+  5A–5D. All four presets must have names: `restore_backup` never writes
+  an empty preset over a named one, so a slot that starts empty could not
+  be restored after the test fills it.
 
 ### Step 0 — Safety backup
 

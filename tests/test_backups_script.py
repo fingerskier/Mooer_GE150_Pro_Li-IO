@@ -60,6 +60,20 @@ def test_subset_keeps_one_bank(backups, tmp_path):
     assert json.loads(out.read_text())["format"] == "mooer-ge150-backup"
 
 
+def test_subset_refuses_a_bank_with_an_empty_preset(backups, tmp_path):
+    """restore_backup never writes an empty entry over a named preset, so
+    an empty slot the test fills could not be restored afterwards."""
+    a = _backup(tmp_path / "a.json")
+    data = json.loads(a.read_text())
+    data["presets"][18]["name"] = ""  # 5C
+    a.write_text(json.dumps(data))
+    out = tmp_path / "bank5.json"
+
+    with pytest.raises(SystemExit, match="5C"):
+        backups.main(["subset", str(a), str(out), "5"])
+    assert not out.exists()
+
+
 def test_subset_never_overwrites(backups, tmp_path):
     a = _backup(tmp_path / "a.json")
     out = tmp_path / "bank5.json"

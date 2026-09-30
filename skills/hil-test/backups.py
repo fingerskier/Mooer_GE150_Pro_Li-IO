@@ -5,7 +5,8 @@ Standard library only, so it runs anywhere Python 3 does.
 
   backups.py compare BEFORE AFTER     list presets whose bytes differ
   backups.py subset BACKUP OUT BANK   write OUT holding only bank BANK
-                                      (e.g. 5 -> 5A-5D), for restore_backup
+                                      (e.g. 5 -> 5A-5D), for restore_backup;
+                                      refuses a bank with an empty preset
 
 Exit status: 0 on success or identical backups, 1 if they differ, 2 on
 bad usage or input.
@@ -61,6 +62,16 @@ def subset(backup: str, out: str, bank: str) -> int:
     presets = [e for e in data["presets"] if e["address"] in wanted]
     if len(presets) != 4:
         raise SystemExit(f"{backup}: bank {number} is incomplete")
+    # restore_backup never writes an empty backup entry over a named
+    # preset, so a slot that starts empty could not be emptied again after
+    # the test names it: the restore would silently leave test data behind.
+    empty = [e["address"] for e in presets if not e["name"].strip()]
+    if empty:
+        raise SystemExit(
+            f"bank {number} has empty presets ({', '.join(empty)}), which "
+            "restore_backup could not restore after the test; choose a "
+            "bank whose four presets all have names"
+        )
     target = Path(out)
     if target.exists():
         raise SystemExit(f"{out} already exists")
