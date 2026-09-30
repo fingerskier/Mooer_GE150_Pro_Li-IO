@@ -31,16 +31,16 @@ def _canonical(block):
     """A module block as it looks after a wire round-trip (10 params)."""
     return decode_module_block(encode_module_block(block))
 
-from .fake_max_pedal import FakeMaxPedal, make_max_connection
+from .fake_max_pedal import make_pedal
 from .test_restore_overwrite import _get_server_module
 
 
 @pytest.fixture
 def wired():
     server = _get_server_module()
-    conn, pedal = make_max_connection()
-    server._record_cache = {}
-    with patch.object(server, "_get_connection", return_value=conn):
+    server.pedal, conn, pedal = make_pedal()
+    # The fake needs none of the pacing real hardware does.
+    with patch("time.sleep"):
         yield server, conn, pedal
 
 
@@ -50,7 +50,7 @@ class TestSetGetRoundTrip:
         result = server.set_preset(
             5,
             name="Tone Five",
-            effects={
+            modules={
                 "amp": {"effect_type": 9, "params": [111, 50, 50]},
                 "delay": {"enabled": True, "params": [50, 50, 480]},
             },
@@ -88,7 +88,7 @@ class TestSetGetRoundTrip:
         """The old per-param names (amp_gain, ...) came from a speculative
         model; the error should steer callers to the real schema."""
         server, _, _ = wired
-        result = server.set_preset(0, effects={"amp": {"amp_gain": 100}})
+        result = server.set_preset(0, modules={"amp": {"amp_gain": 100}})
         assert "error" in result
         assert "effect_type" in result["error"]
 
@@ -117,7 +117,7 @@ class TestCopyAndSwap:
         """Editing the copy afterwards must not change the source."""
         server, _, pedal = wired
         server.copy_preset(0, 9)
-        server.set_preset(9, effects={"amp": {"effect_type": 42}})
+        server.set_preset(9, modules={"amp": {"effect_type": 42}})
         assert pedal.records[1].modules[Command.AMP].effect_type != 42
 
     def test_swap_uses_live_writes_not_brackets(self, wired):
@@ -215,7 +215,7 @@ class TestBackupRestore:
 
         # Wreck a preset, then restore over it.
         server.set_preset(6, name="Wrecked",
-                          effects={"amp": {"effect_type": 63}})
+                          modules={"amp": {"effect_type": 63}})
         restored = server.restore_backup(str(path), overwrite=True)
 
         assert restored["restored"] is True

@@ -15,6 +15,7 @@ them as provisional.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field, replace
 from enum import IntEnum
 
@@ -246,6 +247,40 @@ def address_to_slot(bank: int, position: str) -> int:
         + PRESET_POSITIONS.index(letter)
         + FIRST_PRESET_SLOT
     )
+
+
+def parse_preset(ref: int | str) -> int:
+    """Resolve a preset reference to a 0-based slot (0-199).
+
+    Accepts the address the pedal displays -- bank 1-50 and position A-D,
+    such as ``"5A"`` or ``"49d"`` -- or a 0-based slot number, given as an
+    int or as a string of digits.
+
+    >>> parse_preset("5A")
+    16
+    >>> parse_preset(16)
+    16
+    """
+    if isinstance(ref, bool):
+        raise ValueError(f"Not a preset: {ref!r}")
+    if isinstance(ref, int):
+        slot = ref
+    else:
+        text = str(ref).strip().upper()
+        address = re.fullmatch(r"(\d{1,2})([A-D])", text)
+        if address:
+            return address_to_slot(int(address[1]), address[2]) - FIRST_PRESET_SLOT
+        if not text.isdigit():
+            raise ValueError(
+                f"Not a preset: {ref!r}. Use the pedal's address, such as "
+                f"'5A', or a slot number 0-{LAST_PRESET_SLOT - 1}."
+            )
+        slot = int(text)
+    if not 0 <= slot < LAST_PRESET_SLOT:
+        raise ValueError(
+            f"Slot must be 0-{LAST_PRESET_SLOT - 1}, got {slot}"
+        )
+    return slot
 
 
 def build_command(command: Command, payload: bytes = b"") -> bytes:

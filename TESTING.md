@@ -1,167 +1,122 @@
-# Patch (Preset) Read/Write Test Process
+# Testing
 
-This document defines the test process for verifying patch R/W — reading
-presets from the pedal, writing them back, and moving them through the
-`.mo` / `.mbf` file formats. It has two tiers:
+Two tiers:
 
 1. **Automated tests** — run on every change, no hardware required.
-2. **Hardware-in-the-loop (HIL) procedure** — run against a real
-   GE150 Pro Li before a release or after any protocol-layer change.
+2. **Hardware-in-the-loop (HIL)** — run against a real pedal before a
+   release and after any change to `pedal.py`, `protocol/` or
+   `transport/`.
 
 ---
 
 ## 1. Automated tests (no hardware)
 
-### Setup
-
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
+uv run --no-project --with-editable . --with pytest --with pytest-asyncio \
+    python -m pytest -q
 ```
 
-### Run
-
-```bash
-pytest                      # everything
-pytest tests/test_patch_rw.py -v   # patch R/W suite only
-```
-
-### What is covered, layer by layer
+or, in a virtualenv, `pip install -e ".[dev]"` and then `pytest`.
 
 | Layer | Test file | Coverage |
 |-------|-----------|----------|
-| CRC | `test_crc.py` | Checksum against known vectors |
-| Framing | `test_framing.py` | 64-byte report structure, preamble, checksum, chunk splitting |
-| Command builders | `test_commands.py` | Slot bounds, store-preset payload layout |
-| Preset model | `test_preset.py`, `test_patch_rw.py` | 512-byte serialize/deserialize round-trip, opaque tail-byte (0x9F–0x1FF) preservation, 16-bit delay time, param byte offsets |
-| File formats | `test_file_formats.py` | `.mo` / `.mbf` export–import round-trips, `.gnr` header |
-| Transport | `test_patch_rw.py` | Chunked TX **and** chunked-RX reassembly over a fake HID device |
-| Server tools | `test_patch_rw.py`, `test_restore_overwrite.py` | `get_preset` / `set_preset` / `copy` / `swap` / `export` / `import` / `backup_all` / `restore_backup`, byte-exact copy/swap (opaque data intact), cache coherence without aliasing, overwrite guard |
+| CRC, framing | `test_crc.py`, `test_framing.py` | Checksum vectors, 64-byte reports, chunking |
+| Captures | `test_capture_*.py` | Golden frames from the USB captures in `log/` |
+| Command builders | `test_commands.py`, `test_terminology.py` | Payload layouts, slot/address numbering, `parse_preset` |
+| Tools on the fake pedal | `test_tools_rewired.py`, `test_patch_rw.py`, `test_restore_overwrite.py` | Every MCP tool, the timing guards, reconnect after reboot, restore overwrite rules |
+| Legacy model | `test_preset.py`, `test_file_formats.py` | The pre-capture 512-byte model in `models/`, which the server no longer uses |
 
-The patch R/W suite drives the **real** protocol and transport code
-against `tests/fake_device.py` — a fake pedal that speaks the wire
-protocol at the 64-byte HID-report level (length prefixes, preamble,
-CRC, chunking). Only the USB hardware layer is simulated, so a failure
-in framing, checksums, chunk reassembly, or preset serialization will
-surface without a device attached.
+The tool tests drive the real `Pedal`, protocol and transport code
+against `tests/fake_max_pedal.py`, which speaks only the exchanges seen
+in the captures, at the 64-byte report level. The fake can also ignore a
+select or go silent, to exercise the failure paths. Its fixtures skip
+the pacing sleeps and can never reach real hardware.
 
-### Definition of pass
-
-* `pytest` exits 0.
-* Any new tool touching preset data must ship with a round-trip test in
-  `tests/test_patch_rw.py` (write → read back → byte-identical in
-  canonical `Preset` form) and a JSON-serializability check
-  (`json.dumps(result)`), since MCP tool results are JSON-encoded.
+Definition of pass: `pytest` exits 0, and a new tool that changes a
+preset ships with a test that reads the change back.
 
 ---
 
 ## 2. Hardware-in-the-loop procedure
 
-Run on a real pedal before releases and after any change to
-`protocol/` or `transport/`.
-
 ### Prerequisites
 
-* GE150 Pro Li connected via USB-C, powered on, **fully charged or on
-  mains** (a power loss mid-write can corrupt a slot).
-* Mooer Studio software **closed** (it holds the HID interface).
-* Linux: the udev rule in `udev/70-mooer-ge150.rules` installed (VID:PID
-  `34db:000f`), or run with sudo.
-* An MCP client wired to this server, or a Python REPL importing
-  `mooer_ge150_mcp.server` directly.
+* The pedal on USB and powered, with MOOER Studio closed.
+* Linux: the udev rule from `udev/` installed (see the README).
+* The MCP server connected (in this repo, Claude Code starts it from
+  `.mcp.json`), or a Python script using `mooer_ge150_mcp.server`.
+* A **scratch bank** whose presets may be overwritten. The examples use
+  5A–5D.
 
-### Step 0 — Safety backup (mandatory)
+### Step 0 — Safety backup
 
-```text
-connect
-backup_all  output_path=./pre_test_backup.mbf
-```
+`backup_all output_path=./pre_test.json`. It must report
+`preset_count: 200` and no `missing_slots`. Do not continue otherwise, and
+keep the file until the run is verified.
 
-Verify the file exists, is non-trivially sized, and the result has no
-`failed_slots`/`warning` field. **Do not proceed** if the backup reports
-failures. Keep this file until the whole session is verified.
+### Step 1 — Reads
 
-### Step 1 — Identify
+* `get_device_info` connects and reports `GE150Max` and the active preset.
+* `list_presets start=5A end=5D` shows the names the pedal displays.
+* `get_preset preset=5A` returns nine modules and a 12-byte `tail`.
+* `get_ctrl_config preset=5A` matches the preset's CTRL setup.
 
-```text
-get_device_info
-```
+### Step 2 — Live edits are not stored
 
-Pass: model reads `GE150...` and a plausible firmware version — not
-`unknown`. If this fails, stop; nothing downstream is trustworthy.
+1. `select_preset preset=5A` reports `confirmed: true`.
+2. `toggle_effect module=reverb enabled=false`, then select 5A again.
+3. `get_preset preset=5A` still shows reverb in its original state.
 
-### Step 2 — Read path
+### Step 3 — Stored writes, no reboot
 
-1. `get_preset slot=0` — returns a full effects dict, no error.
-2. On the pedal screen, open preset 0 and compare the name and 2–3
-   parameter values (amp type, gain, delay time) against the tool output.
-3. `list_presets start=0 end=9` — names match the pedal display.
+1. `set_preset preset=5C name="HIL Temp"`. Straight after it,
+   `get_preset preset=5C` must show the new name.
+2. `copy_preset source=5B destination=5C`. 5C now matches 5B, tail
+   included.
+3. `swap_presets first=5C second=5D`. Names and modules swap, but each
+   slot keeps its own tail.
 
-Pass: values match the pedal exactly.
+### Step 4 — Timing guards
 
-### Step 3 — Write path (use a scratch slot, e.g. 199)
+Select 5B, read 5C's CTRL config, then select 5A, with no pauses between
+the calls. Every select must be confirmed, and the pedal must not drop
+off USB (`journalctl -k | grep "USB disconnect"`). This exact sequence
+hung the pedal before the guards existed.
 
-1. `get_preset slot=199` — record its current state.
-2. `set_preset slot=199 name="TEST RW" effects={"amp": {"amp_gain": 123}}`
-3. `get_preset slot=199` — name is `TEST RW`, amp_gain is 123.
-4. On the pedal, navigate away and back to slot 199 — the display shows
-   the new name.
-5. **Persistence:** power-cycle the pedal, reconnect, `get_preset
-   slot=199` — the change survived the reboot.
+### Step 5 — Writes that reboot the pedal
 
-Pass: read-back matches on both the tool side and the pedal display,
-including after a power cycle.
+Each of these reboots the pedal by design and should reconnect within
+about 10 s, reporting `reconnected: true`:
 
-### Step 4 — File round-trips
+* `put_preset preset=5D contents=<get_preset of 5A>`. 5D matches 5A,
+  tail included.
+* `swap_presets first=5A second=5B byte_exact=true`. Both raw records
+  swap, byte for byte.
+* `copy_preset source=5C destination=5D byte_exact=true`.
 
-1. `export_preset slot=199 output_path=./t.mo`, then
-   `import_preset input_path=./t.mo slot=198`.
-   `get_preset slot=198` must equal slot 199 (name + all params).
-2. Open `t.mo` in Mooer Studio (if available) — it must load cleanly.
-   This cross-checks our format assumptions against the vendor tool.
+### Step 6 — Restore and compare
 
-### Step 5 — Copy / swap
-
-1. `copy_preset from_slot=199 to_slot=197`, verify 197 == 199.
-2. `swap_presets slot_a=197 slot_b=196`, verify both moved.
-
-### Step 6 — Backup / restore round-trip
-
-1. `backup_all output_path=./full.mbf` — no `failed_slots`.
-2. Modify scratch slot 199 (`set_preset slot=199 name="CHANGED"`).
-3. `restore_backup input_path=./full.mbf overwrite=true`.
-4. `get_preset slot=199` — name is back to the backed-up value.
-5. Spot-check 3 random other slots against the pedal display.
-
-### Step 7 — Cleanup
-
-Restore the original state from Step 0:
-
-```text
-restore_backup input_path=./pre_test_backup.mbf overwrite=true
-```
-
-Spot-check a few slots, then `disconnect`.
+`restore_backup input_path=<backup with only the scratch bank>
+overwrite=true`, then `backup_all` again. All 200 records must be
+byte-identical to Step 0's file. Compare against the Step 0 file, not a
+backup taken partway through the run.
 
 ### Recording results
 
-Log each step as PASS/FAIL with firmware version, OS, and backend
-(hidapi/pyusb). Any FAIL in steps 1–3 blocks release; capture the raw
-frames (set `logging` to DEBUG) and file an issue with the hex dumps.
+Log each step as PASS/FAIL with the date, OS and hidapi backend. Any
+failure in Steps 0–3 blocks a release. For a failure, set the
+`mooer_ge150_mcp` loggers to DEBUG and keep the log.
 
 ---
 
-## Known protocol assumptions to verify on hardware
+## Hardware timing facts
 
-These are encoded in the implementation but derived from SPEC.md rather
-than confirmed captures — the HIL run is what validates them:
+Measured on a GE150 Max; `pedal.py` enforces all of them.
 
-* Preset read responses (0x83) arrive chunked across multiple 64-byte
-  reports and are reassembled by `USBConnection.read_message()`.
-* `.mbf` holds **199** preset entries of 0x222 bytes (SPEC.md), while
-  the device exposes slots 0–199 (200 slots) — slot 199 is therefore
-  not covered by `backup_all`. If Mooer Studio backups prove to contain
-  200 entries, update `MBF_PRESET_COUNT` and its tests.
-* Real-time delay-time updates send two single-byte writes (offsets 5
-  and 6). If the device expects one 16-bit write, adjust
-  `set_effect_param`.
+| Fact | Consequence |
+|---|---|
+| A select is answered about 0.2 s later by `0x2A`, then a `0x29` naming the loaded slot | Nothing is sent after a select until that `0x29` arrives |
+| After a CTRL read the pedal is busy about 1 s; a select 0.5 s later hung it | 2 s of quiet after CTRL traffic before a select, save or restore |
+| A save takes effect 0.15–0.65 s after it is sent | 1 s of quiet after every save |
+| Unpaced records in a restore bracket rebooted it | 20 ms between reports, 100 ms between records |
+| `RESTORE_END` always reboots it; reopened about 1 s into start-up, its HID interface went silent | Reconnect waits for it to settle, confirms it answers, falls back to a USB port reset |

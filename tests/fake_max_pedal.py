@@ -43,6 +43,7 @@ from mooer_ge150_mcp.protocol.framing import (
     message_total_size,
     parse_message,
 )
+from mooer_ge150_mcp.pedal import Pedal
 from mooer_ge150_mcp.transport.usb_connection import USBConnection
 
 NUM_SLOTS = 200
@@ -296,7 +297,25 @@ def make_max_connection(
     conn._device = pedal
     conn._backend = "hidapi"
     conn._connected = True
-    # reconnect() enumerates real HID devices; a test must never be able
-    # to reach actual hardware (it did once, and read a live pedal).
+    # reconnect(), open() and reset_usb() touch real USB devices; a test
+    # must never be able to reach actual hardware (it did once, and read
+    # a live pedal). Reopening re-attaches the fake instead.
+    def reopen():
+        conn._device = pedal
+        conn._backend = "hidapi"
+        conn._connected = True
+        return conn.device_info
+
     conn.reconnect = lambda timeout_s=20.0: True
+    conn.open = reopen
+    conn.reset_usb = lambda: False
     return conn, pedal
+
+
+def make_pedal(
+    fake: FakeMaxPedal | None = None,
+) -> tuple[Pedal, USBConnection, FakeMaxPedal]:
+    """Return a Pedal wired to a FakeMaxPedal, with its connection and
+    the fake. Reopening after a disconnect re-attaches the same fake."""
+    conn, fake = make_max_connection(fake)
+    return Pedal(connection=conn, open_connection=lambda: conn), conn, fake

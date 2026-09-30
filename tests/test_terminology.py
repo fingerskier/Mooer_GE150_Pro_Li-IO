@@ -10,6 +10,7 @@ from __future__ import annotations
 import pytest
 
 from mooer_ge150_mcp.protocol.commands import (
+    parse_preset,
     LAST_PRESET_SLOT,
     MODULE_CHAIN,
     MODULE_COMMAND_MAP,
@@ -121,3 +122,21 @@ class TestPresetAddressing:
     def test_renamed_preset_from_the_capture_resolves_to_its_address(self):
         """Slot 0xC1 -- the one renamed "Asatooo1" on the pedal -- is 49A."""
         assert slot_to_address(0xC1) == "49A"
+
+
+class TestPresetReferences:
+    """Tools take the address the pedal shows, or the server's slot."""
+
+    @pytest.mark.parametrize("ref, slot", [
+        ("1A", 0), ("5A", 16), ("5d", 19), (" 49A ", 192), ("50D", 199),
+        (0, 0), (199, 199), ("16", 16),
+    ])
+    def test_resolves(self, ref, slot):
+        assert parse_preset(ref) == slot
+
+    @pytest.mark.parametrize("ref", [
+        "0A", "51A", "5E", "A5", "5AA", "", "five", 200, -1, True,
+    ])
+    def test_rejects(self, ref):
+        with pytest.raises(ValueError):
+            parse_preset(ref)
