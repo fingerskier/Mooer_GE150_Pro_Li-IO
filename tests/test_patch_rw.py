@@ -109,7 +109,8 @@ class TestCopyAndSwap:
         target = pedal.records[10]
         assert target.name == source.name
         assert target.modules == source.modules
-        assert target.tail == source.tail  # live state carries the tail
+        # A live save carries the tail: confirmed on hardware 2026-09-30.
+        assert target.tail == source.tail
         assert target.slot == 10
 
     def test_copy_does_not_alias_records(self, wired):

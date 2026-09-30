@@ -691,3 +691,56 @@ class TestCtrlQuietTime:
             server, lambda: server.copy_preset(0, 9, byte_exact=True)
         )
         assert naps[0] > 1.5
+
+
+class TestRebootReconnect:
+    """A restore bracket ends in a reboot. Reopening the device is not
+    proof the pedal is back: on hardware it once came up silent until its
+    USB port was reset (2026-09-30)."""
+
+    def test_answering_pedal_needs_no_reset(self, wired):
+        server, conn, _ = wired
+        conn.reset_usb = lambda: pytest.fail("reset not needed")
+        assert server._reconnect(conn) is True
+
+    def test_silent_pedal_is_recovered_by_a_usb_reset(self, wired):
+        server, conn, pedal = wired
+        pedal.mute = True
+        resets = []
+
+        def reset_usb():
+            resets.append(1)
+            pedal.mute = False
+            return True
+
+        conn.reset_usb = reset_usb
+        conn.open = lambda: None
+        with patch.object(server.time, "sleep"):
+            assert server._reconnect(conn) is True
+        assert resets == [1]
+
+    def test_reports_failure_when_the_pedal_stays_silent(self, wired):
+        server, conn, pedal = wired
+        conn.reset_usb = lambda: False  # e.g. not on Linux
+
+        def go_mute(timeout_s=20.0):
+            pedal.mute = True
+            return True
+
+        conn.reconnect = go_mute
+        with patch.object(server.time, "sleep"):
+            result = server.put_preset(4, {"name": "X", "modules": {}})
+        assert result["acknowledged"] is True
+        assert result["reconnected"] is False
+
+    def test_ack_is_found_behind_a_queued_broadcast(self, wired):
+        """After a reboot the pedal pushes its whole state; a write that
+        landed was reported unacknowledged behind it."""
+        server, _, pedal = wired
+        server._fetch_all_records()  # tail lookup must not flush the queue
+        for command in MODULE_CHAIN + MODULE_CHAIN:
+            pedal._respond(command & 0x7F, bytes(24))
+
+        result = server.put_preset(4, {"name": "Landed", "modules": {}})
+
+        assert result["acknowledged"] is True

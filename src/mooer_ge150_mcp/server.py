@@ -86,6 +86,9 @@ SELECT_SETTLE_TIMEOUT_MS = 3000
 #: late (0.36 s against the usual 0.24 s); 2.0 s was clean every time.
 CTRL_SETTLE_SECONDS = 2.0
 
+#: Time to give the kernel to re-bind its drivers after a USB port reset.
+USB_RESET_SETTLE_SECONDS = 4.0
+
 #: Reported when a live write is abandoned because the select it depends
 #: on was never confirmed.
 SELECT_UNCONFIRMED = (
@@ -240,6 +243,44 @@ def _read_active_modules() -> dict[Any, Any] | None:
 
 
 
+def _pedal_answers(conn, attempts: int = 3) -> bool:
+    """True if the pedal replies to a read of its active preset."""
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(1.0)
+        conn.drain()
+        reply = conn.send_and_expect(
+            build_read_active_preset(), Command.ACTIVE_STATE, timeout_ms=1500
+        )
+        if reply is not None:
+            return True
+    return False
+
+
+def _reconnect(conn) -> bool:
+    """Ride through the reboot that ends a restore bracket.
+
+    Reopening the device is not enough: the pedal can come back on the
+    bus with its HID interface silent (observed live 2026-09-30, after a
+    reopen about a second into its start-up). So this confirms the pedal
+    answers, and if it does not, resets its USB port and tries again.
+
+    Returns:
+        True only if the pedal is answering requests again.
+    """
+    if conn.reconnect() and _pedal_answers(conn):
+        return True
+    logger.warning("Pedal silent after its reboot; resetting its USB port")
+    if not conn.reset_usb():
+        return False
+    time.sleep(USB_RESET_SETTLE_SECONDS)
+    try:
+        conn.open()
+    except ConnectionError:
+        return False
+    return _pedal_answers(conn)
+
+
 def _upload_records(conn, records: list) -> int:
     """Upload preset records via WRITE_PRESET inside a restore bracket.
 
@@ -249,6 +290,10 @@ def _upload_records(conn, records: list) -> int:
     """
     acked = 0
     _wait_for_ctrl_quiet()
+    # Messages the pedal pushed earlier (it rebroadcasts its whole state
+    # after a reboot) would otherwise be read ahead of the acks; a write
+    # that landed was reported unacknowledged that way in live testing.
+    conn.drain()
     conn.write(build_restore_begin())
     time.sleep(WRITE_PACING_SECONDS)
     try:
@@ -256,13 +301,8 @@ def _upload_records(conn, records: list) -> int:
             for report in build_write_preset_record(record):
                 conn.write(report)
                 time.sleep(WRITE_PACING_SECONDS)
-            for _ in range(8):
-                ack = conn.read_message()
-                if ack is None:
-                    break
-                if ack.command == Command.WRITE_PRESET_ACK:
-                    acked += 1
-                    break
+            if conn.expect(Command.WRITE_PRESET_ACK) is not None:
+                acked += 1
             # The editor paces successive records ~100 ms apart; sending
             # them back-to-back rebooted the pedal in live testing.
             time.sleep(0.1)
@@ -638,14 +678,14 @@ def copy_preset(
 
     By default this is the editor's own "save as": select the source so
     its stored state is live, then commit that to the destination. No
-    reboot, but the source becomes the active preset, and whether a live
-    save carries the 12-byte preset tail (settings not yet decoded) is
-    not confirmed on hardware.
+    reboot, and the copy carries the modules and the 12-byte preset tail
+    (confirmed on hardware). The source becomes the active preset, and
+    the name is re-padded with NULs.
 
-    With ``byte_exact=True`` the raw record -- name padding, tail and
-    all -- is re-slotted and uploaded with the restore-style write
-    instead. Exact, but THE PEDAL REBOOTS afterwards; the connection
-    reconnects automatically.
+    With ``byte_exact=True`` the raw record -- name padding included --
+    is re-slotted and uploaded with the restore-style write instead, and
+    the active preset is left alone. THE PEDAL REBOOTS afterwards; the
+    connection reconnects automatically (about 10 s).
 
     Args:
         from_slot: Source slot (0-199).
@@ -671,7 +711,7 @@ def copy_preset(
             "to": to_slot,
             "name": source.name,
             "byte_exact": True,
-            "reconnected": conn.reconnect(),
+            "reconnected": _reconnect(conn),
         }
 
     # The editor's own "save as": select the source so its state is
@@ -706,8 +746,9 @@ def swap_presets(
     decoded), which the live path cannot write.
 
     With ``byte_exact=True`` both raw records are re-slotted and uploaded
-    with the restore-style write, so the tails swap too -- but THE PEDAL
-    REBOOTS afterwards; the connection reconnects automatically.
+    with the restore-style write, so the tails swap too (confirmed on
+    hardware) -- but THE PEDAL REBOOTS afterwards; the connection
+    reconnects automatically (about 10 s).
 
     Args:
         slot_a: First slot (0-199).
@@ -733,7 +774,7 @@ def swap_presets(
             "slot_a": slot_a,
             "slot_b": slot_b,
             "byte_exact": True,
-            "reconnected": conn.reconnect(),
+            "reconnected": _reconnect(conn),
         }
 
     if not _write_record_live(conn, slot_a + FIRST_PRESET_SLOT, rec_b):
@@ -1038,9 +1079,9 @@ def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
 
     acked = _upload_records(conn, to_write) if to_write else 0
     # RESTORE_END reboots the pedal by design; ride through it.
-    reconnected = conn.reconnect() if to_write else True
+    reconnected = _reconnect(conn) if to_write else True
     result: dict[str, Any] = {
-        "restored": True,
+        "restored": acked == len(to_write),
         "preset_count": acked,
         "reconnected": reconnected,
     }
@@ -1587,7 +1628,7 @@ def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
 
     conn = _get_connection()
     acked = _upload_records(conn, [record])
-    reconnected = conn.reconnect()
+    reconnected = _reconnect(conn)
     return {
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),

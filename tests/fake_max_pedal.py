@@ -83,6 +83,9 @@ class FakeMaxPedal:
         self.active_slot = 1
         self.written_blocks: list[tuple[int, ModuleBlock]] = []
         self.selected: list[int] = []
+        #: True while the pedal ignores everything, as it did on hardware
+        #: when reopened too soon after a reboot.
+        self.mute = False
         #: Wire slots whose select goes unanswered, as from a hung pedal.
         self.silent_selects: set[int] = set()
         self.saves: list[tuple[int, bytes]] = []
@@ -150,6 +153,9 @@ class FakeMaxPedal:
         return bytes([self.active_slot, 0x01]) + blocks + record.tail
 
     def _handle(self, command: int, payload: bytes) -> None:
+        if self.mute:
+            return
+
         if command == Command.HELLO:
             return  # the pedal does not answer the hello
 
