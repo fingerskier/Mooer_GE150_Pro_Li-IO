@@ -20,8 +20,10 @@ import pytest
 
 from mooer_ge150_mcp.protocol.commands import (
     Command,
+    ModuleBlock,
     decode_module_block,
     encode_module_block,
+    encode_preset_record,
 )
 
 
@@ -107,7 +109,8 @@ class TestCopyAndSwap:
         target = pedal.records[10]
         assert target.name == source.name
         assert target.modules == source.modules
-        assert target.tail == source.tail  # live state carries the tail
+        # A live save carries the tail: confirmed on hardware 2026-09-30.
+        assert target.tail == source.tail
         assert target.slot == 10
 
     def test_copy_does_not_alias_records(self, wired):
@@ -122,10 +125,11 @@ class TestCopyAndSwap:
         server.swap_presets(0, 7)
         assert pedal.restore_brackets == []
 
-    def test_swap_exchanges_slots_byte_exactly(self, wired):
+    def test_live_swap_exchanges_names_and_modules(self, wired):
         server, _, pedal = wired
         pedal.records[1].tail = b"A" * 12
         pedal.records[8].tail = b"B" * 12
+        pedal.records[8].modules[Command.AMP] = ModuleBlock(True, 42, [7])
         name_a, name_b = pedal.records[1].name, pedal.records[8].name
 
         result = server.swap_presets(0, 7)
@@ -133,8 +137,41 @@ class TestCopyAndSwap:
         assert result["swapped"] is True
         assert pedal.records[1].name == name_b
         assert pedal.records[8].name == name_a
-        # tails travel with the live state in the fake; on hardware the
-        # tail semantics of a live save are not fully pinned down
+        assert pedal.records[1].modules[Command.AMP].effect_type == 42
+        # The live path cannot write the tail: each slot keeps its own,
+        # as the docstring says. byte_exact=True is the way to move it.
+        assert pedal.records[1].tail == b"A" * 12
+        assert pedal.records[8].tail == b"B" * 12
+
+    def test_byte_exact_swap_moves_the_raw_records(self, wired):
+        server, _, pedal = wired
+        pedal.records[1].tail = b"A" * 12
+        pedal.records[8].tail = b"B" * 12
+        raw_a = encode_preset_record(pedal.records[1])[1:]
+        raw_b = encode_preset_record(pedal.records[8])[1:]
+
+        result = server.swap_presets(0, 7, byte_exact=True)
+
+        assert result["swapped"] is True
+        assert result["reconnected"] is True
+        assert pedal.restore_brackets == ["begin", "end"]
+        assert pedal.selected == []
+        # Everything after the slot byte, name padding and tail included.
+        assert encode_preset_record(pedal.records[1])[1:] == raw_b
+        assert encode_preset_record(pedal.records[8])[1:] == raw_a
+
+    def test_byte_exact_copy_uploads_the_raw_record(self, wired):
+        server, _, pedal = wired
+        pedal.records[1].tail = bytes(range(12))
+        pedal.records[1].name_raw = b"Space Padded    "
+        raw = encode_preset_record(pedal.records[1])[1:]
+
+        result = server.copy_preset(0, 9, byte_exact=True)
+
+        assert result["copied"] is True
+        assert pedal.uploaded == [10]
+        assert pedal.selected == []  # the active preset is left alone
+        assert encode_preset_record(pedal.records[10])[1:] == raw
 
 
 class TestExportImport:

@@ -389,6 +389,22 @@ class TestCtrlConfig:
         assert toggles["reverb"] is True
         assert toggles["amp"] is False
 
+    def test_ignores_a_pushed_0x29_for_another_slot(self, wired):
+        """A preset load makes the pedal push a 0x29 for that slot. One
+        queued ahead of the reply used to be taken as the answer."""
+        server, _, pedal = wired
+        pedal.ctrl_flags[5] = [c in (Command.DELAY, Command.REVERB)
+                               for c in MODULE_CHAIN]
+        pedal._respond(0x2A, bytes(9))
+        pedal._respond(Command.CTRL_CONFIG, bytes([0]) + bytes(9))
+
+        result = server.get_ctrl_config(5)
+
+        assert result["slot"] == 5
+        assert {m for m, on in result["toggles"].items() if on} == {
+            "delay", "reverb"
+        }
+
     def test_ctrl_slots_are_zero_based_on_the_wire(self, wired):
         server, _, pedal = wired
         server.set_ctrl_config(0, ["amp"])
@@ -425,6 +441,40 @@ class TestPutPreset:
         original = server.get_preset(10)
         server.put_preset(11, original)
         assert server.get_preset(11)["name"] == original["name"]
+
+    def test_round_trip_carries_the_tail(self, wired):
+        """put_preset(get_preset(x)) used to zero the 12-byte tail."""
+        server, _, pedal = wired
+        pedal.records[11].tail = bytes(range(1, 13))  # server slot 10
+
+        server.put_preset(10, server.get_preset(10))  # in place
+        server.put_preset(11, server.get_preset(10))  # to another slot
+
+        assert pedal.records[11].tail == bytes(range(1, 13))
+        assert pedal.records[12].tail == bytes(range(1, 13))
+
+    def test_without_a_tail_the_slot_keeps_its_own(self, wired):
+        server, _, pedal = wired
+        pedal.records[5].tail = b"\xAB" * 12
+        server.put_preset(4, {"name": "No Tail", "modules": {}})
+        assert pedal.records[5].tail == b"\xAB" * 12
+
+    def test_kept_tail_is_read_fresh_not_from_the_cache(self, wired):
+        """A cached dump may predate an edit made on the pedal itself;
+        its tail must not be written back as if it were current."""
+        server, _, pedal = wired
+        server.list_presets(0, 9)  # fills the dump cache
+        pedal.records[5].tail = b"\xCD" * 12  # changed on the pedal since
+
+        server.put_preset(4, {"name": "Fresh", "modules": {}})
+
+        assert pedal.records[5].tail == b"\xCD" * 12
+
+    def test_rejects_a_malformed_tail(self, wired):
+        server, _, pedal = wired
+        assert "error" in server.put_preset(4, {"name": "x", "tail": "zz"})
+        assert "error" in server.put_preset(4, {"name": "x", "tail": "00"})
+        assert pedal.uploaded == []
 
     def test_rejects_bad_slot_and_module(self, wired):
         server, _, pedal = wired
@@ -488,3 +538,249 @@ class TestUserModelUploads:
         server, _, _ = wired
         assert "error" in server.upload_cab(20, "X", "00" * 1536)
         assert "error" in server.upload_amp(20, "X", "00" * 10240)
+
+
+class TestOptimizePresetPrompt:
+    """The prompt used to say "set_effect_param, then set_preset to save",
+    which rewrote the slot from its stored copy and lost the edits."""
+
+    def test_prescribes_select_edit_save(self, wired):
+        server, _, _ = wired
+        text = server.optimize_preset(3, "more clarity")
+        assert "select_preset slot=3" in text
+        assert "save_preset slot=3" in text
+        assert "then set_preset to save" not in text
+
+    def test_the_prescribed_workflow_keeps_the_edit(self, wired):
+        server, _, pedal = wired
+        name = server.get_preset(3)["name"]
+
+        server.select_preset(3)
+        server.set_effect_param("amp", 0, 99)
+        server.save_preset(3, name)
+
+        saved = pedal.records[4]
+        assert saved.modules[Command.AMP].params[0] == 99
+        assert saved.name == name
+
+
+class TestSelectSettles:
+    """Nothing may follow a select until the pedal reports the preset
+    loaded: a command landing mid-load hung real hardware (2026-09-30)."""
+
+    def test_select_consumes_the_load_complete_push(self, wired):
+        server, conn, pedal = wired
+        pedal.ctrl_flags[4] = [c == Command.DS for c in MODULE_CHAIN]
+
+        result = server.select_preset(4)
+
+        assert result["confirmed"] is True
+        left = []
+        while (frame := conn.read_message()) is not None:
+            left.append(frame.command)
+        assert Command.CTRL_CONFIG not in left
+
+    def test_select_preset_slot_reports_the_confirmation(self, wired):
+        server, _, pedal = wired
+        assert server.select_preset_slot(4)["selected"] is True
+        pedal.silent_selects = {6}
+        assert server.select_preset_slot(5)["selected"] is False
+
+    def test_unanswered_select_is_reported(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {5}
+        result = server.select_preset(4)
+        assert result["confirmed"] is False
+        assert "warning" in result
+
+    def test_a_stale_0x29_for_the_same_slot_does_not_count(self, wired):
+        """Left over from earlier, it would end the wait before the load
+        had even begun."""
+        server, _, pedal = wired
+        pedal._respond(Command.CTRL_CONFIG, bytes([4]) + bytes(9))
+        pedal.silent_selects = {5}
+        assert server.select_preset(4)["confirmed"] is False
+
+    def test_set_preset_writes_nothing_without_confirmation(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {6}
+
+        result = server.set_preset(
+            5, name="Nope", effects={"amp": {"effect_type": 9}}
+        )
+
+        assert result["stored"] is False
+        assert "error" in result
+        assert pedal.written_blocks == []
+        assert pedal.saves == []
+
+    def test_write_preset_writes_nothing_without_confirmation(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {6}
+
+        result = server.write_preset(5, "Nope", {"amp": {"effect_type": 9}})
+
+        assert "error" in result
+        assert pedal.written_blocks == []
+        assert pedal.saves == []
+
+    def test_copy_saves_nothing_without_confirmation(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {1}
+        result = server.copy_preset(0, 9)
+        assert result["copied"] is False
+        assert pedal.saves == []
+
+    def test_half_done_swap_hands_back_the_displaced_preset(self, wired):
+        server, _, pedal = wired
+        name_a, name_b = pedal.records[1].name, pedal.records[8].name
+        pedal.records[1].tail = bytes(range(12))
+        pedal.silent_selects = {8}  # the second write's select
+
+        result = server.swap_presets(0, 7)
+
+        assert result["swapped"] is False
+        assert pedal.records[1].name == name_b  # first half landed
+        assert pedal.records[8].name == name_b  # second half did not
+        assert result["displaced"]["name"] == name_a
+        assert result["displaced"]["tail"] == bytes(range(12)).hex()
+
+    def test_swap_writes_nothing_if_the_first_select_fails(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {1}
+        result = server.swap_presets(0, 7)
+        assert result["swapped"] is False
+        assert "displaced" not in result
+        assert pedal.saves == []
+
+    def test_drain_discards_queued_input(self, wired):
+        _, conn, pedal = wired
+        pedal._respond(0x2A, bytes(9))
+        pedal._respond(Command.CTRL_CONFIG, bytes(10))
+        assert conn.drain() == 2
+        assert conn.read_message() is None
+
+
+class TestCtrlQuietTime:
+    """After a CTRL read the pedal is busy for about a second, and a
+    select landing in that window hung real hardware (2026-09-30)."""
+
+    def _slept(self, server, call):
+        naps = []
+        with patch.object(server.time, "sleep", naps.append):
+            call()
+        return naps
+
+    def test_select_waits_out_a_recent_ctrl_read(self, wired):
+        server, _, _ = wired
+        server.get_ctrl_config(3)
+        naps = self._slept(server, lambda: server.select_preset(4))
+        assert len(naps) == 1
+        assert 1.5 < naps[0] <= server.CTRL_SETTLE_SECONDS
+
+    def test_no_wait_without_ctrl_traffic(self, wired):
+        server, _, _ = wired
+        assert self._slept(server, lambda: server.select_preset(4)) == []
+
+    def test_consecutive_ctrl_reads_are_not_delayed(self, wired):
+        server, _, _ = wired
+        server.get_ctrl_config(3)
+        assert self._slept(server, lambda: server.get_ctrl_config(4)) == []
+
+    def test_ctrl_write_starts_the_quiet_time_too(self, wired):
+        server, _, _ = wired
+        server.set_ctrl_config(3, ["delay"])
+        naps = self._slept(server, lambda: server.select_preset(4))
+        assert naps and naps[0] > 1.5
+
+    def test_save_and_restore_bracket_wait_too(self, wired):
+        server, _, _ = wired
+        server.get_ctrl_config(3)
+        assert self._slept(server, lambda: server.save_preset(4, "X"))[0] > 1.5
+        server.get_ctrl_config(3)
+        naps = self._slept(
+            server, lambda: server.copy_preset(0, 9, byte_exact=True)
+        )
+        assert naps[0] > 1.5
+
+
+class TestRebootReconnect:
+    """A restore bracket ends in a reboot. Reopening the device is not
+    proof the pedal is back: on hardware it once came up silent until its
+    USB port was reset (2026-09-30)."""
+
+    def test_answering_pedal_needs_no_reset(self, wired):
+        server, conn, _ = wired
+        conn.reset_usb = lambda: pytest.fail("reset not needed")
+        assert server._reconnect(conn) is True
+
+    def test_silent_pedal_is_recovered_by_a_usb_reset(self, wired):
+        server, conn, pedal = wired
+        pedal.mute = True
+        resets = []
+
+        def reset_usb():
+            resets.append(1)
+            pedal.mute = False
+            return True
+
+        conn.reset_usb = reset_usb
+        conn.open = lambda: None
+        with patch.object(server.time, "sleep"):
+            assert server._reconnect(conn) is True
+        assert resets == [1]
+
+    def test_reports_failure_when_the_pedal_stays_silent(self, wired):
+        server, conn, pedal = wired
+        conn.reset_usb = lambda: False  # e.g. not on Linux
+
+        def go_mute(timeout_s=20.0):
+            pedal.mute = True
+            return True
+
+        conn.reconnect = go_mute
+        with patch.object(server.time, "sleep"):
+            result = server.put_preset(4, {"name": "X", "modules": {}})
+        assert result["acknowledged"] is True
+        assert result["reconnected"] is False
+
+    def test_ack_is_found_behind_a_queued_broadcast(self, wired):
+        """After a reboot the pedal pushes its whole state; a write that
+        landed was reported unacknowledged behind it."""
+        server, _, pedal = wired
+        for command in MODULE_CHAIN + MODULE_CHAIN:
+            pedal._respond(command & 0x7F, bytes(24))
+
+        # An explicit tail means no dump runs first to flush the queue.
+        result = server.put_preset(
+            4, {"name": "Landed", "modules": {}, "tail": "00" * 12}
+        )
+
+        assert result["acknowledged"] is True
+
+
+class TestDumpCacheLifetime:
+    """The dump cache describes one connected pedal; it must not outlive
+    the connection."""
+
+    def test_disconnect_drops_the_cache(self, wired):
+        server, conn, _ = wired
+        server._connection = conn
+        server.list_presets(0, 9)
+        assert server._record_cache
+
+        server.disconnect()
+
+        assert server._record_cache == {}
+
+    def test_connect_starts_with_an_empty_cache(self, wired):
+        server, conn, _ = wired
+        server.list_presets(0, 9)
+        assert server._record_cache
+
+        with patch.object(server, "USBConnection", return_value=conn), \
+                patch.object(conn, "open", return_value=conn.device_info):
+            server._connection = None
+            server.connect()
+
+        assert server._record_cache == {}

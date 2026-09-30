@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +64,7 @@ from .protocol.commands import (
     encode_module_block,
     encode_preset_record,
     PRESET_RECORD_SIZE,
+    PRESET_TAIL_SIZE,
     build_command,
 )
 from .transport.usb_connection import USBConnection
@@ -73,6 +75,25 @@ logger = logging.getLogger(__name__)
 #: merely unreliable: back-to-back bracketed records made the pedal
 #: watchdog-reboot in live testing (2026-07-26).
 WRITE_PACING_SECONDS = 0.02
+
+#: How long to wait for the pedal to report a selected preset loaded. It
+#: normally does so about 0.2 s after the select.
+SELECT_SETTLE_TIMEOUT_MS = 3000
+
+#: Quiet time the pedal needs after CTRL traffic before it can take a
+#: select. Measured live 2026-09-30: a select 0.5 s after a CTRL read
+#: hung the pedal until its watchdog reset it; 1.0 s worked but answered
+#: late (0.36 s against the usual 0.24 s); 2.0 s was clean every time.
+CTRL_SETTLE_SECONDS = 2.0
+
+#: Time to give the kernel to re-bind its drivers after a USB port reset.
+USB_RESET_SETTLE_SECONDS = 4.0
+
+#: Reported when a live write is abandoned because the select it depends
+#: on was never confirmed.
+SELECT_UNCONFIRMED = (
+    "The pedal did not confirm the preset select, so nothing was written."
+)
 
 #: File-format tags for backups and single-preset exports.
 BACKUP_FORMAT = "mooer-ge150-backup"
@@ -205,6 +226,8 @@ def _record_to_dict(record: Any) -> dict[str, Any]:
             }
             for command in MODULE_CHAIN
         },
+        # Undecoded preset-level bytes; put_preset writes them back.
+        "tail": record.tail.hex(),
     }
 
 
@@ -220,6 +243,44 @@ def _read_active_modules() -> dict[Any, Any] | None:
 
 
 
+def _pedal_answers(conn, attempts: int = 3) -> bool:
+    """True if the pedal replies to a read of its active preset."""
+    for attempt in range(attempts):
+        if attempt:
+            time.sleep(1.0)
+        conn.drain()
+        reply = conn.send_and_expect(
+            build_read_active_preset(), Command.ACTIVE_STATE, timeout_ms=1500
+        )
+        if reply is not None:
+            return True
+    return False
+
+
+def _reconnect(conn) -> bool:
+    """Ride through the reboot that ends a restore bracket.
+
+    Reopening the device is not enough: the pedal can come back on the
+    bus with its HID interface silent (observed live 2026-09-30, after a
+    reopen about a second into its start-up). So this confirms the pedal
+    answers, and if it does not, resets its USB port and tries again.
+
+    Returns:
+        True only if the pedal is answering requests again.
+    """
+    if conn.reconnect() and _pedal_answers(conn):
+        return True
+    logger.warning("Pedal silent after its reboot; resetting its USB port")
+    if not conn.reset_usb():
+        return False
+    time.sleep(USB_RESET_SETTLE_SECONDS)
+    try:
+        conn.open()
+    except ConnectionError:
+        return False
+    return _pedal_answers(conn)
+
+
 def _upload_records(conn, records: list) -> int:
     """Upload preset records via WRITE_PRESET inside a restore bracket.
 
@@ -228,6 +289,11 @@ def _upload_records(conn, records: list) -> int:
     number of records the pedal acknowledged.
     """
     acked = 0
+    _wait_for_ctrl_quiet()
+    # Messages the pedal pushed earlier (it rebroadcasts its whole state
+    # after a reboot) would otherwise be read ahead of the acks; a write
+    # that landed was reported unacknowledged that way in live testing.
+    conn.drain()
     conn.write(build_restore_begin())
     time.sleep(WRITE_PACING_SECONDS)
     try:
@@ -235,13 +301,8 @@ def _upload_records(conn, records: list) -> int:
             for report in build_write_preset_record(record):
                 conn.write(report)
                 time.sleep(WRITE_PACING_SECONDS)
-            for _ in range(8):
-                ack = conn.read_message()
-                if ack is None:
-                    break
-                if ack.command == Command.WRITE_PRESET_ACK:
-                    acked += 1
-                    break
+            if conn.expect(Command.WRITE_PRESET_ACK) is not None:
+                acked += 1
             # The editor paces successive records ~100 ms apart; sending
             # them back-to-back rebooted the pedal in live testing.
             time.sleep(0.1)
@@ -249,6 +310,58 @@ def _upload_records(conn, records: list) -> int:
         conn.write(build_restore_end())
     _record_cache.clear()
     return acked
+
+
+#: time.monotonic() before which the pedal is still digesting CTRL
+#: traffic (see CTRL_SETTLE_SECONDS).
+_ctrl_quiet_until = 0.0
+
+
+def _note_ctrl_traffic() -> None:
+    """Record that a CTRL read/write just went out."""
+    global _ctrl_quiet_until
+    _ctrl_quiet_until = time.monotonic() + CTRL_SETTLE_SECONDS
+
+
+def _wait_for_ctrl_quiet() -> None:
+    """Hold off until the pedal has digested any recent CTRL traffic.
+
+    Call before a select, a save or a restore bracket. Only the select is
+    proven to hang the pedal; the other two get the same margin because a
+    reset in the middle of a stored write is the costlier failure.
+    """
+    remaining = _ctrl_quiet_until - time.monotonic()
+    if remaining > 0:
+        time.sleep(remaining)
+
+
+def _select_and_settle(conn, slot: int) -> bool:
+    """Select a preset and wait until the pedal has finished loading it.
+
+    The pedal answers every select -- even of the preset already active --
+    about 0.2 s later with 0x2A and then a 0x29 naming the loaded slot
+    (0-based). A command that arrives inside that window can hang the
+    pedal until its watchdog resets it (observed live 2026-09-30, with a
+    CTRL read sent straight after a select), so nothing may follow a
+    select until that 0x29 has been seen.
+
+    Args:
+        conn: Open connection.
+        slot: Wire slot, 1-based.
+
+    Returns:
+        True once the pedal reports the slot loaded, False on timeout.
+    """
+    _wait_for_ctrl_quiet()
+    # A 0x29 for this slot left over from earlier would end the wait
+    # before the load has even started.
+    conn.drain()
+    loaded = conn.send_and_expect(
+        build_select_preset_slot(slot), Command.CTRL_CONFIG,
+        timeout_ms=SELECT_SETTLE_TIMEOUT_MS,
+        match=lambda frame: frame.payload[:1] == bytes([slot - 1]),
+    )
+    return loaded is not None
 
 
 def _write_record_live(conn, slot: int, record) -> bool:
@@ -265,10 +378,11 @@ def _write_record_live(conn, slot: int, record) -> bool:
         record: PresetRecord whose modules and name to write.
 
     Returns:
-        True if the pedal echoed the save (0x17).
+        False if the pedal never confirmed the select, in which case
+        nothing was written; True otherwise.
     """
-    conn.write(build_select_preset_slot(slot))
-    time.sleep(0.1)
+    if not _select_and_settle(conn, slot):
+        return False
     for command in MODULE_CHAIN:
         block = record.modules.get(command)
         if block is None:
@@ -360,6 +474,8 @@ def connect() -> dict[str, Any]:
             "model": _connection.device_info.product,
         }
 
+    # The dump cache describes whichever pedal was connected before.
+    _record_cache.clear()
     _connection = USBConnection()
     try:
         info = _connection.open()
@@ -393,6 +509,7 @@ def connect() -> dict[str, Any]:
 def disconnect() -> dict[str, bool]:
     """Close the USB connection to the pedal."""
     global _connection
+    _record_cache.clear()
     if _connection is None:
         return {"disconnected": True}
     _connection.close()
@@ -519,17 +636,23 @@ def set_preset(
     if name is not None:
         record = record.with_name(name)
     stored = _write_record_live(conn, slot + FIRST_PRESET_SLOT, record)
-    return {
+    result: dict[str, Any] = {
         "stored": stored,
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
         "name": record.name,
     }
+    if not stored:
+        result["error"] = SELECT_UNCONFIRMED
+    return result
 
 
 @mcp.tool()
 def select_preset(slot: int) -> dict[str, Any]:
     """Switch the pedal's active preset.
+
+    Returns once the pedal reports the preset loaded (about 0.2 s), so
+    the next command cannot land mid-load.
 
     Args:
         slot: Preset index (0-199).
@@ -539,20 +662,38 @@ def select_preset(slot: int) -> dict[str, Any]:
 
     # The wire slot is 1-based; the previous implementation sent the
     # 0-based index and selected the preset one below the one asked for.
-    _get_connection().write(build_select_preset_slot(slot + FIRST_PRESET_SLOT))
-    return {"active": slot, "address": slot_to_address(slot + FIRST_PRESET_SLOT)}
+    confirmed = _select_and_settle(_get_connection(), slot + FIRST_PRESET_SLOT)
+    result: dict[str, Any] = {
+        "active": slot,
+        "address": slot_to_address(slot + FIRST_PRESET_SLOT),
+        "confirmed": confirmed,
+    }
+    if not confirmed:
+        result["warning"] = "The pedal did not report the preset loaded"
+    return result
 
 
 @mcp.tool()
-def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
+def copy_preset(
+    from_slot: int, to_slot: int, byte_exact: bool = False
+) -> dict[str, Any]:
     """Copy a preset from one slot to another.
 
-    Byte-exact: the raw record (name padding, tail and all) is re-slotted
-    and uploaded, so unmodeled data survives the copy.
+    By default this is the editor's own "save as": select the source so
+    its stored state is live, then commit that to the destination. No
+    reboot, and the copy carries the modules and the 12-byte preset tail
+    (confirmed on hardware). The source becomes the active preset, and
+    the name is re-padded with NULs.
+
+    With ``byte_exact=True`` the raw record -- name padding included --
+    is re-slotted and uploaded with the restore-style write instead, and
+    the active preset is left alone. THE PEDAL REBOOTS afterwards; the
+    connection reconnects automatically (about 10 s).
 
     Args:
         from_slot: Source slot (0-199).
         to_slot: Destination slot (0-199).
+        byte_exact: Upload the raw record (reboots the pedal).
     """
     if not 0 <= from_slot <= 199 or not 0 <= to_slot <= 199:
         return {"error": "Slots must be 0-199"}
@@ -563,10 +704,28 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
     if source is None:
         return {"error": f"Device did not return a record for slot {from_slot}"}
 
+    if byte_exact:
+        acked = _upload_records(
+            conn, [replace(source, slot=to_slot + FIRST_PRESET_SLOT)]
+        )
+        return {
+            "copied": acked == 1,
+            "from": from_slot,
+            "to": to_slot,
+            "name": source.name,
+            "byte_exact": True,
+            "reconnected": _reconnect(conn),
+        }
+
     # The editor's own "save as": select the source so its state is
     # live, then commit that state to the destination slot.
-    conn.write(build_select_preset_slot(from_slot + FIRST_PRESET_SLOT))
-    time.sleep(0.1)
+    if not _select_and_settle(conn, from_slot + FIRST_PRESET_SLOT):
+        return {
+            "copied": False,
+            "from": from_slot,
+            "to": to_slot,
+            "error": SELECT_UNCONFIRMED,
+        }
     conn.write(build_save_preset(to_slot + FIRST_PRESET_SLOT, source.name))
     time.sleep(0.15)
     _record_cache.clear()
@@ -579,12 +738,25 @@ def copy_preset(from_slot: int, to_slot: int) -> dict[str, Any]:
 
 
 @mcp.tool()
-def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
-    """Swap two preset slots, byte-exactly.
+def swap_presets(
+    slot_a: int, slot_b: int, byte_exact: bool = False
+) -> dict[str, Any]:
+    """Swap two preset slots.
+
+    By default each slot is rewritten through the live path (select,
+    write the modules, save): names and modules swap without a reboot,
+    but each slot keeps its own 12-byte preset tail (settings not yet
+    decoded), which the live path cannot write.
+
+    With ``byte_exact=True`` both raw records are re-slotted and uploaded
+    with the restore-style write, so the tails swap too (confirmed on
+    hardware) -- but THE PEDAL REBOOTS afterwards; the connection
+    reconnects automatically (about 10 s).
 
     Args:
         slot_a: First slot (0-199).
         slot_b: Second slot (0-199).
+        byte_exact: Swap the raw records (reboots the pedal).
     """
     if not 0 <= slot_a <= 199 or not 0 <= slot_b <= 199:
         return {"error": "Slots must be 0-199"}
@@ -595,10 +767,43 @@ def swap_presets(slot_a: int, slot_b: int) -> dict[str, Any]:
     if rec_a is None or rec_b is None:
         return {"error": "Device did not return both preset records"}
 
-    ok_a = _write_record_live(conn, slot_a + FIRST_PRESET_SLOT, rec_b)
+    if byte_exact:
+        acked = _upload_records(conn, [
+            replace(rec_b, slot=slot_a + FIRST_PRESET_SLOT),
+            replace(rec_a, slot=slot_b + FIRST_PRESET_SLOT),
+        ])
+        return {
+            "swapped": acked == 2,
+            "slot_a": slot_a,
+            "slot_b": slot_b,
+            "byte_exact": True,
+            "reconnected": _reconnect(conn),
+        }
+
+    if not _write_record_live(conn, slot_a + FIRST_PRESET_SLOT, rec_b):
+        return {
+            "swapped": False,
+            "slot_a": slot_a,
+            "slot_b": slot_b,
+            "error": SELECT_UNCONFIRMED,
+        }
     time.sleep(0.2)
-    ok_b = _write_record_live(conn, slot_b + FIRST_PRESET_SLOT, rec_a)
-    return {"swapped": ok_a and ok_b, "slot_a": slot_a, "slot_b": slot_b}
+    if not _write_record_live(conn, slot_b + FIRST_PRESET_SLOT, rec_a):
+        # Half done: slot_a is overwritten and its old preset now exists
+        # only here. Hand it back so it can be written somewhere.
+        return {
+            "swapped": False,
+            "slot_a": slot_a,
+            "slot_b": slot_b,
+            "error": (
+                f"Slot {slot_a} now holds slot {slot_b}'s preset, but the "
+                f"pedal did not confirm the select of slot {slot_b}, so it "
+                f"was not written. Slot {slot_a}'s previous preset is in "
+                f"'displaced'; write it back with put_preset or set_preset."
+            ),
+            "displaced": _record_to_dict(rec_a),
+        }
+    return {"swapped": True, "slot_a": slot_a, "slot_b": slot_b}
 
 
 # ─── EFFECT PARAMETER TOOLS ──────────────────────────────────────────
@@ -614,6 +819,9 @@ def set_effect_param(
     The pedal has no single-parameter write: the editor resends the
     module's whole block on every change. This reads the active preset's
     current state, substitutes the one value, and writes the block back.
+
+    The change is live only: commit it with save_preset before switching
+    presets, or it is lost.
 
     Args:
         module: Effect module (fx, ds, amp, cab, ns, eq, mod, delay, reverb).
@@ -665,6 +873,7 @@ def toggle_effect(module: str, enabled: bool) -> dict[str, Any]:
 
     Changes the module's ON/OFF status while preserving its effect type
     and parameters, by reading the active preset and rewriting the block.
+    Live only, like set_effect_param: commit with save_preset.
 
     Args:
         module: Effect module (fx, ds, amp, cab, ns, eq, mod, delay, reverb).
@@ -873,9 +1082,9 @@ def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
 
     acked = _upload_records(conn, to_write) if to_write else 0
     # RESTORE_END reboots the pedal by design; ride through it.
-    reconnected = conn.reconnect() if to_write else True
+    reconnected = _reconnect(conn) if to_write else True
     result: dict[str, Any] = {
-        "restored": True,
+        "restored": acked == len(to_write),
         "preset_count": acked,
         "reconnected": reconnected,
     }
@@ -944,12 +1153,15 @@ def import_preset(input_path: str, slot: int) -> dict[str, Any]:
     stored = _write_record_live(
         _get_connection(), slot + FIRST_PRESET_SLOT, record
     )
-    return {
+    result: dict[str, Any] = {
         "imported": stored,
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
         "name": record.name,
     }
+    if not stored:
+        result["error"] = SELECT_UNCONFIRMED
+    return result
 
 
 # ─── IR / CABINET TOOLS ──────────────────────────────────────────────
@@ -1072,11 +1284,12 @@ def select_preset_slot(slot: int) -> dict[str, Any]:
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
 
-    _get_connection().write(build_select_preset_slot(slot + FIRST_PRESET_SLOT))
     return {
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
-        "selected": True,
+        "selected": _select_and_settle(
+            _get_connection(), slot + FIRST_PRESET_SLOT
+        ),
     }
 
 
@@ -1094,7 +1307,9 @@ def save_preset(slot: int, name: str) -> dict[str, Any]:
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
 
-    _get_connection().write(build_save_preset(slot + FIRST_PRESET_SLOT, name))
+    conn = _get_connection()
+    _wait_for_ctrl_quiet()
+    conn.write(build_save_preset(slot + FIRST_PRESET_SLOT, name))
     _record_cache.clear()
     return {
         "slot": slot,
@@ -1147,7 +1362,11 @@ def write_preset(
     except ValueError as exc:
         return {"error": str(exc)}
 
-    for report in reports:
+    # reports[0] is the select; the preset must finish loading before
+    # the module blocks and the save follow it.
+    if not _select_and_settle(conn, slot + FIRST_PRESET_SLOT):
+        return {"error": SELECT_UNCONFIRMED, "saved": False}
+    for report in reports[1:]:
         conn.write(report)
         time.sleep(WRITE_PACING_SECONDS)
 
@@ -1295,9 +1514,13 @@ def get_ctrl_config(slot: int) -> dict[str, Any]:
         return {"error": "Slot must be 0-199"}
 
     conn = _get_connection()
+    # A preset select pushes an identical-looking 0x29 for the selected
+    # slot, which may still be queued -- only the requested slot counts.
     response = conn.send_and_expect(
-        build_read_ctrl_config(slot), Command.CTRL_CONFIG
+        build_read_ctrl_config(slot), Command.CTRL_CONFIG,
+        match=lambda frame: frame.payload[:1] == bytes([slot]),
     )
+    _note_ctrl_traffic()
     if response is None:
         return {"error": "No CTRL config reply from device"}
 
@@ -1334,6 +1557,8 @@ def set_ctrl_config(slot: int, modules: list[str]) -> dict[str, Any]:
 
     flags = [c in wanted for c in MODULE_CHAIN]
     _get_connection().write(build_write_ctrl_config(slot, flags))
+    # Not measured for the write, but it is the same CTRL traffic.
+    _note_ctrl_traffic()
     return {"slot": slot, "toggles": sorted(m.lower() for m in modules)}
 
 
@@ -1343,17 +1568,19 @@ def set_ctrl_config(slot: int, modules: list[str]) -> dict[str, Any]:
 def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
     """Write a complete preset record directly to a slot.
 
-    This is the restore-style write: byte-exact including the tail, but
-    THE PEDAL REBOOTS a moment after (RESTORE_END does that by design,
-    exactly as after MOOER Studio's own restore). Prefer set_preset /
-    write_preset for interactive edits; use this when byte fidelity
-    matters and a reboot is acceptable. The connection reconnects
+    This is the restore-style write: it sets every module AND the 12-byte
+    preset tail (settings not yet decoded), which the live path cannot
+    write -- but THE PEDAL REBOOTS a moment after (RESTORE_END does that
+    by design, exactly as after MOOER Studio's own restore). Prefer
+    set_preset / write_preset for interactive edits; use this when the
+    tail matters and a reboot is acceptable. The connection reconnects
     automatically.
 
     Args:
         slot: Target preset slot 0-199.
         preset: A preset as returned by get_preset -- ``name`` plus
-            ``modules``, each with enabled / effect_type / params.
+            ``modules``, each with enabled / effect_type / params, and
+            ``tail`` (hex). Without ``tail`` the slot keeps its own.
     """
     if not 0 <= slot <= 199:
         return {"error": "Slot must be 0-199"}
@@ -1379,9 +1606,34 @@ def put_preset(slot: int, preset: dict[str, Any]) -> dict[str, Any]:
         blocks.setdefault(command, ModuleBlock(enabled=False, effect_type=0))
     record.modules = blocks
 
+    # A fresh record's tail is all zeros, which would silently wipe the
+    # undecoded preset-level settings; never write that by default.
+    if preset.get("tail") is not None:
+        try:
+            tail = bytes.fromhex(str(preset["tail"]))
+        except ValueError:
+            return {"error": "tail must be hex, as get_preset returns it"}
+        if len(tail) != PRESET_TAIL_SIZE:
+            return {
+                "error": f"tail must be {PRESET_TAIL_SIZE} bytes, "
+                         f"got {len(tail)}"
+            }
+    else:
+        # Always a fresh read. A cached record may predate an edit made
+        # on the pedal, and its tail would go out as if it were current.
+        existing = _fetch_all_records().get(slot)
+        if existing is None:
+            return {
+                "error": f"Device did not return a record for slot {slot}, "
+                         "so its tail cannot be preserved; pass the "
+                         "preset's tail explicitly"
+            }
+        tail = existing.tail
+    record.tail = tail
+
     conn = _get_connection()
     acked = _upload_records(conn, [record])
-    reconnected = conn.reconnect()
+    reconnected = _reconnect(conn)
     return {
         "slot": slot,
         "address": slot_to_address(slot + FIRST_PRESET_SLOT),
@@ -1519,9 +1771,15 @@ Consider:
 - Noise gate threshold relative to gain level
 - EQ balance and frequency shaping
 - Effect levels and interactions
-- Signal chain order optimization
+(The effect chain order is fixed on this pedal, so don't suggest reordering.)
 
-Use set_effect_param to make real-time adjustments, then set_preset to save."""
+To apply changes:
+1. select_preset slot={slot} -- set_effect_param and toggle_effect edit the
+   ACTIVE preset only, so make this one active first.
+2. Adjust with set_effect_param / toggle_effect and let the user listen.
+3. Commit with save_preset slot={slot} and the preset's current name.
+Do not save with set_preset: it rewrites the slot from its stored copy and
+discards the live edits."""
 
 
 @mcp.prompt()

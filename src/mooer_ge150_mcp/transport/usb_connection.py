@@ -9,8 +9,12 @@ descriptor in ``log/various_tests.pcapng`` places at interface 5 with
 
 from __future__ import annotations
 
+import glob
 import logging
+import os
+import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..protocol.framing import (
@@ -28,6 +32,17 @@ HID_INTERFACE = 5
 EP_IN = 0x85
 EP_OUT = 0x05
 READ_TIMEOUT_MS = 1000
+
+#: After RESTORE_END the pedal takes a moment to drop off the bus. Wait
+#: this long for it to go before assuming it is not going to reboot.
+REBOOT_START_TIMEOUT_S = 5.0
+#: Time to leave the pedal alone after it re-enumerates. Reopened about
+#: a second in, while it was still broadcasting its state, its HID
+#: interface went silent until the host reset the USB port (observed
+#: live 2026-09-30). Three seconds in, it had always finished.
+REOPEN_SETTLE_S = 4.0
+#: Linux ``USBDEVFS_RESET`` ioctl request.
+_USBDEVFS_RESET = 0x5514
 
 #: The IDs this repo targeted before the USB capture. They belong to the
 #: older STM32-based Mooer units (GE200 and relatives), not to this pedal.
@@ -184,7 +199,11 @@ class USBConnection:
 
         RESTORE_END (0xBB) makes the pedal reboot and re-enumerate by
         design -- MOOER Studio's own restore shows the same USB address
-        change. Polls for the device and reopens the same interface.
+        change. This waits for the pedal to leave the bus, to come back,
+        and then to finish starting up before reopening the interface.
+
+        A True return means the device was reopened, not that the pedal
+        is answering; the caller should confirm with a request.
         """
         import hid
 
@@ -193,34 +212,94 @@ class USBConnection:
                 self._device.close()
         except Exception:
             pass
+        self._device = None
         self._connected = False
 
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            time.sleep(1.0)
+        def find():
             try:
                 infos = hid.enumerate(self._vendor_id, self._product_id)
             except Exception:
-                continue
-            target = next(
+                return None
+            return next(
                 (i for i in infos
                  if i.get("interface_number") == HID_INTERFACE),
                 None,
             )
-            if target is None:
-                continue
+
+        # Reopening before the reboot has begun would return a handle to
+        # the instance that is about to disappear.
+        deadline = time.monotonic() + REBOOT_START_TIMEOUT_S
+        while time.monotonic() < deadline and find() is not None:
+            time.sleep(0.2)
+
+        deadline = time.monotonic() + timeout_s
+        while find() is None:
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "Device did not come back within %.0fs", timeout_s
+                )
+                return False
+            time.sleep(0.5)
+
+        time.sleep(REOPEN_SETTLE_S)
+        target = find()
+        if target is None:
+            logger.warning("Device vanished again while settling")
+            return False
+        try:
+            device = hid.device()
+            device.open_path(target["path"])
+            device.set_nonblocking(False)
+        except Exception as e:
+            logger.warning("Could not reopen device: %s", e)
+            return False
+        self._device = device
+        self._backend = "hidapi"
+        self._connected = True
+        logger.info("Reconnected after device re-enumeration")
+        return True
+
+    def reset_usb(self) -> bool:
+        """Have the host reset the pedal's USB port. Linux only.
+
+        The last resort for a pedal that is on the bus but no longer
+        answers on its HID interface. It does not reboot the pedal; it
+        re-initialises the USB link, which was enough to bring a silent
+        pedal back in live testing. Closes the connection first: call
+        :meth:`open` again afterwards, once the kernel has re-bound its
+        drivers (a few seconds).
+
+        Returns:
+            True if a reset was issued.
+        """
+        self.close()
+        if not sys.platform.startswith("linux"):
+            return False
+        import fcntl  # POSIX only
+
+        for vendor_file in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+            base = os.path.dirname(vendor_file)
             try:
-                device = hid.device()
-                device.open_path(target["path"])
-                device.set_nonblocking(False)
-            except Exception:
+                with open(vendor_file) as f:
+                    vendor = int(f.read(), 16)
+                with open(os.path.join(base, "idProduct")) as f:
+                    product = int(f.read(), 16)
+                if (vendor, product) != (self._vendor_id, self._product_id):
+                    continue
+                with open(os.path.join(base, "busnum")) as f:
+                    bus = int(f.read())
+                with open(os.path.join(base, "devnum")) as f:
+                    address = int(f.read())
+                fd = os.open(f"/dev/bus/usb/{bus:03d}/{address:03d}", os.O_WRONLY)
+                try:
+                    fcntl.ioctl(fd, _USBDEVFS_RESET, 0)
+                finally:
+                    os.close(fd)
+            except (OSError, ValueError) as e:
+                logger.warning("USB reset failed: %s", e)
                 continue
-            self._device = device
-            self._backend = "hidapi"
-            self._connected = True
-            logger.info("Reconnected after device re-enumeration")
+            logger.info("Reset the pedal's USB port")
             return True
-        logger.warning("Device did not come back within %.0fs", timeout_s)
         return False
 
     def write(self, data: bytes) -> int:
@@ -284,6 +363,22 @@ class USBConnection:
             logger.debug("Read error: %s", e)
             return None
 
+    def drain(self, max_reports: int = 256) -> int:
+        """Discard reports already queued from the pedal.
+
+        The pedal pushes state unprompted, so stale input can sit ahead
+        of the next reply. Call this before an exchange that must not be
+        satisfied by something the pedal said earlier.
+
+        Returns:
+            The number of reports discarded.
+        """
+        count = 0
+        # 1 ms, not 0: hidapi treats a zero timeout as a blocking read.
+        while count < max_reports and self.read(timeout_ms=1) is not None:
+            count += 1
+        return count
+
     def read_message(self, timeout_ms: int = READ_TIMEOUT_MS) -> Frame | None:
         """Read one complete protocol message, reassembling chunked reports.
 
@@ -346,6 +441,7 @@ class USBConnection:
         command: int,
         timeout_ms: int = READ_TIMEOUT_MS,
         max_skip: int = 32,
+        match: Callable[[Frame], bool] | None = None,
     ) -> Frame | None:
         """Send a command and return the first reply with *command*.
 
@@ -359,18 +455,35 @@ class USBConnection:
             command: The reply command ID to wait for.
             timeout_ms: Timeout for each individual report read.
             max_skip: Give up after this many unrelated messages.
+            match: Optional extra check on a *command* reply. Needed where
+                the pedal pushes the same command unprompted: a preset
+                select pushes a 0x29 that is indistinguishable from a
+                CTRL-config reply except by its slot byte.
 
         Returns:
             The matching Frame, or None on timeout or if too many
             unrelated messages arrived first.
         """
         self.write(data)
+        return self.expect(command, timeout_ms, max_skip, match)
 
+    def expect(
+        self,
+        command: int,
+        timeout_ms: int = READ_TIMEOUT_MS,
+        max_skip: int = 32,
+        match: Callable[[Frame], bool] | None = None,
+    ) -> Frame | None:
+        """Read until a message with *command* arrives.
+
+        The reading half of :meth:`send_and_expect`, for requests that
+        span several reports and so are written separately.
+        """
         for _ in range(max_skip + 1):
             frame = self.read_message(timeout_ms)
             if frame is None:
                 return None
-            if frame.command == command:
+            if frame.command == command and (match is None or match(frame)):
                 return frame
             logger.debug(
                 "Skipping unsolicited 0x%02X while awaiting 0x%02X",
