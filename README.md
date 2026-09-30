@@ -59,14 +59,25 @@ node bin/mooer-ge150-mcp.mjs
 > The package is not on npm or PyPI yet, so `npx mooer-ge150-mcp` and
 > `pip install mooer-ge150-mcp` do not work. See [Publishing](#publishing).
 
-## Features
+## Tools
 
-* Connect to the pedal via USB and read/write system settings
-* Manage all 200 preset slots (read, write, copy, swap, rename)
-* Real-time effect parameter control
-* Backup and restore presets (.mbf files)
-* Import/export individual presets (.mo files)
-* Upload impulse responses to user IR slots
+Presets are addressed as the pedal shows them, such as `"5A"`, or by
+slot number 0–199. The connection opens on first use.
+
+| Group | Tools |
+|---|---|
+| Read | `get_device_info`, `list_presets`, `get_preset`, `get_ctrl_config`, `list_user_models` |
+| Live edits, not stored until saved | `select_preset`, `set_effect_param`, `toggle_effect` |
+| Stored, no reboot | `save_preset`, `set_preset`, `copy_preset`, `swap_presets`, `import_preset`, `set_ctrl_config` |
+| Stored, **reboots the pedal** | `put_preset`, `restore_backup`, and `byte_exact=true` on copy/swap |
+| Files | `backup_all`, `export_preset` |
+| Global | `set_system_settings`, `set_global_eq`, `set_expression_target` |
+| User models | `upload_cab`, `upload_amp` (wire blobs, not `.gir`/`.wav`/`.gnr` files) |
+| Connection | `disconnect` |
+
+Every tool is annotated as read-only or not, and as destructive or not,
+so an MCP client can auto-allow reads and ask before writes. Backups
+are JSON files holding each preset byte for byte.
 
 ## Publishing
 

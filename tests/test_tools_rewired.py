@@ -11,19 +11,22 @@ from unittest.mock import patch
 
 import pytest
 
-from mooer_ge150_mcp.protocol.commands import Command, MODULE_CHAIN
+from mooer_ge150_mcp.pedal import CTRL_SETTLE_SECONDS
+from mooer_ge150_mcp.protocol.commands import (
+    Command, MODULE_CHAIN, encode_module_block,
+)
 
-from .fake_max_pedal import FakeMaxPedal, make_max_connection
+from .fake_max_pedal import make_pedal
 from .test_restore_overwrite import _get_server_module
 
 
 @pytest.fixture
 def wired():
-    """Server module with a FakeMaxPedal patched in as the connection."""
+    """Server module whose Pedal talks to a FakeMaxPedal."""
     server = _get_server_module()
-    conn, pedal = make_max_connection()
-    server._record_cache = {}
-    with patch.object(server, "_get_connection", return_value=conn):
+    server.pedal, conn, pedal = make_pedal()
+    # The fake needs none of the pacing real hardware does.
+    with patch("time.sleep"):
         yield server, conn, pedal
 
 
@@ -38,34 +41,82 @@ def test_server_imports_and_registers_its_tools():
     import mooer_ge150_mcp.server as real_server
 
     tools = asyncio.run(real_server.mcp.list_tools())
-    assert len(tools) == 36
-    assert "list_ir_slots" in {t.name for t in tools}
+    assert len(tools) == 24
+    assert "list_user_models" in {t.name for t in tools}
 
 
-class TestListIrSlots:
+def test_every_tool_says_whether_it_changes_the_pedal():
+    """Annotations let a client auto-allow reads and confirm writes."""
+    import asyncio
+
+    import mooer_ge150_mcp.server as real_server
+
+    tools = {t.name: t for t in asyncio.run(real_server.mcp.list_tools())}
+    for tool in tools.values():
+        assert tool.annotations is not None, tool.name
+        assert tool.title, tool.name
+
+    reads = {"get_device_info", "list_presets", "get_preset",
+             "get_ctrl_config", "list_user_models"}
+    for name in reads:
+        assert tools[name].annotations.readOnlyHint is True, name
+    for name, tool in tools.items():
+        if name not in reads:
+            assert tool.annotations.readOnlyHint is False, name
+
+    for name in ("put_preset", "restore_backup", "set_preset",
+                 "swap_presets", "copy_preset", "save_preset",
+                 "backup_all", "export_preset"):
+        assert tools[name].annotations.destructiveHint is True, name
+    for name in ("select_preset", "set_effect_param", "toggle_effect"):
+        assert tools[name].annotations.destructiveHint is False, name
+    assert "reboot" in tools["put_preset"].title.lower()
+    assert "reboot" in tools["restore_backup"].title.lower()
+
+
+def test_tools_take_the_pedal_s_own_addresses():
+    """Every preset argument accepts "5A" as well as a slot number."""
+    import asyncio
+
+    import mooer_ge150_mcp.server as real_server
+
+    tools = {t.name: t for t in asyncio.run(real_server.mcp.list_tools())}
+    for tool, arg in [("get_preset", "preset"), ("select_preset", "preset"),
+                      ("copy_preset", "source"), ("swap_presets", "second"),
+                      ("list_presets", "start")]:
+        schema = tools[tool].inputSchema["properties"][arg]
+        kinds = {option.get("type") for option in schema.get("anyOf", [schema])}
+        assert {"integer", "string"} <= kinds, tool
+
+
+class TestListUserModels:
     """Was sending the CAB module-block write; now sends READ_IR_LIST."""
 
-    def test_returns_all_forty_slots(self, wired):
+    def test_splits_amps_and_cabs(self, wired):
         server, _, _ = wired
-        result = server.list_ir_slots()
+        result = server.list_user_models()
         assert "error" not in result
-        assert len(result["slots"]) == 40
+        assert len(result["amps"]) == 20
+        assert len(result["cabs"]) == 20
 
     def test_empty_slots_are_flagged(self, wired):
         server, _, _ = wired
-        assert all(s["empty"] for s in server.list_ir_slots()["slots"])
+        result = server.list_user_models()
+        assert all(m["empty"] for m in result["amps"] + result["cabs"])
 
     def test_named_slots_are_reported(self, wired):
         server, _, pedal = wired
         pedal.ir_names[3] = "Marshall 4x12"
 
-        slots = server.list_ir_slots()["slots"]
-        assert slots[3] == {"slot": 3, "name": "Marshall 4x12", "empty": False}
+        amps = server.list_user_models()["amps"]
+        assert amps[3] == {
+            "index": 3, "display": 59, "name": "Marshall 4x12", "empty": False,
+        }
 
     def test_does_not_write_a_cab_module_block(self, wired):
         """The old implementation sent 0x85, which edits the cab module."""
         server, _, pedal = wired
-        server.list_ir_slots()
+        server.list_user_models()
         assert pedal.written_blocks == []
 
 
@@ -109,6 +160,18 @@ class TestPresetListing:
     def test_bad_range_rejected(self, wired):
         server, _, _ = wired
         assert "error" in server.list_presets(0, 200)
+        assert "error" in server.list_presets("1A", "51A")
+
+    def test_range_takes_addresses(self, wired):
+        server, _, _ = wired
+        presets = server.list_presets("5A", "5D")["presets"]
+        assert [p["slot"] for p in presets] == [16, 17, 18, 19]
+
+    def test_defaults_cover_every_bank(self, wired):
+        server, _, _ = wired
+        presets = server.list_presets()["presets"]
+        assert presets[0]["address"] == "1A"
+        assert presets[-1]["address"] == "50D"
 
 
 class TestGetPreset:
@@ -131,6 +194,16 @@ class TestGetPreset:
         server, _, _ = wired
         amp = server.get_preset(0)["modules"]["amp"]
         assert set(amp) == {"enabled", "effect_type", "params"}
+
+    @pytest.mark.parametrize("ref", ["49A", "49a", " 49A ", 192, "192"])
+    def test_accepts_an_address_or_a_slot(self, wired, ref):
+        server, _, _ = wired
+        assert server.get_preset(ref)["address"] == "49A"
+
+    @pytest.mark.parametrize("ref", ["51A", "5E", "A5", 200, -1, ""])
+    def test_rejects_what_is_not_a_preset(self, wired, ref):
+        server, _, _ = wired
+        assert "error" in server.get_preset(ref)
 
 
 class TestEffectEditing:
@@ -206,8 +279,7 @@ class TestDeviceInfo:
         info = server.get_device_info()
         assert info["vendor_id"] == "0x34DB"
         assert info["product_id"] == "0x000F"
-        assert info["active_slot"] == 193
-        assert info["active_preset"] == "49A"
+        assert info["active"] == {"slot": 192, "address": "49A"}
 
     def test_does_not_claim_a_firmware_version(self, wired):
         """Firmware came from a guessed identify command; it is gone."""
@@ -225,13 +297,13 @@ class TestWritePath:
 
     def test_select_uses_one_based_slots_on_the_wire(self, wired):
         server, _, pedal = wired
-        result = server.select_preset_slot(199)  # 50D
-        assert result["address"] == "50D"
+        result = server.select_preset("50D")
+        assert result["active"] == {"slot": 199, "address": "50D"}
         assert pedal.selected == [200]
 
     def test_save_commits_live_state_under_a_new_name(self, wired):
         server, _, pedal = wired
-        server.select_preset_slot(199)
+        server.select_preset(199)
         server.toggle_effect("amp", False)
 
         result = server.save_preset(199, "ZZTEST")
@@ -246,67 +318,68 @@ class TestWritePath:
         server.save_preset(0, "Renamed")
         assert pedal.records[1].name == "Renamed"
 
-    def test_write_preset_selects_then_writes_then_saves(self, wired):
+    def test_save_keeps_the_current_name_by_default(self, wired):
         server, _, pedal = wired
-        result = server.write_preset(
-            199,
-            "Dual Lead",
-            {"amp": {"enabled": True, "effect_type": 16, "params": [37, 50]}},
+        server.select_preset("5A")
+        server.toggle_effect("amp", False)
+
+        result = server.save_preset("5A")
+
+        assert result["name"] == "Preset 17"
+        assert pedal.records[17].name == "Preset 17"
+        assert pedal.records[17].modules[Command.AMP].enabled is False
+
+    def test_set_preset_selects_then_writes_then_saves(self, wired):
+        server, _, pedal = wired
+        result = server.set_preset(
+            "50D",
+            name="Dual Lead",
+            modules={"amp": {"enabled": True, "effect_type": 16, "params": [37, 50]}},
         )
 
-        assert result["saved"] is True
-        assert result["modules_written"] == ["amp"]
+        assert result["stored"] is True
         assert pedal.selected == [200]
         assert pedal.saves[-1][0] == 200
 
         amp = pedal.records[200].modules[Command.AMP]
         assert amp.effect_type == 16
         assert amp.params[0] == 37
+        assert pedal.records[200].name == "Dual Lead"
 
-    def test_write_preset_leaves_unlisted_modules_alone(self, wired):
+    def test_set_preset_leaves_unlisted_modules_alone(self, wired):
         server, _, pedal = wired
         before = pedal.records[1].modules[Command.REVERB]
 
-        server.write_preset(0, "Only Amp", {"amp": {"effect_type": 3}})
+        server.set_preset(0, modules={"amp": {"effect_type": 3}})
 
-        assert [c for c, _ in pedal.written_blocks] == [Command.AMP]
-        assert pedal.records[1].modules[Command.REVERB] == before
+        after = pedal.records[1].modules[Command.REVERB]
+        assert encode_module_block(after) == encode_module_block(before)
+        assert pedal.records[1].modules[Command.AMP].effect_type == 3
 
-    def test_write_preset_accepts_several_modules_in_chain_order(self, wired):
+    def test_set_preset_writes_blocks_in_chain_order(self, wired):
         server, _, pedal = wired
-        server.write_preset(
-            0,
-            "Multi",
-            {
-                "reverb": {"effect_type": 4, "params": [50, 34]},
-                "amp": {"effect_type": 16},
-            },
-        )
-        # Blocks go out in chain order regardless of dict order.
-        assert [c for c, _ in pedal.written_blocks] == [Command.AMP, Command.REVERB]
+        server.set_preset(0, modules={
+            "reverb": {"effect_type": 4, "params": [50, 34]},
+            "amp": {"effect_type": 16},
+        })
+        written = [c for c, _ in pedal.written_blocks]
+        assert written == sorted(written, key=MODULE_CHAIN.index)
 
-    def test_write_preset_rejects_unknown_module(self, wired):
+    def test_set_preset_rejects_unknown_module(self, wired):
         server, _, pedal = wired
-        result = server.write_preset(0, "Bad", {"chorus": {"effect_type": 1}})
+        result = server.set_preset(0, modules={"chorus": {"effect_type": 1}})
         assert "error" in result
         assert pedal.saves == []
 
-    def test_write_preset_rejects_bad_slot(self, wired):
+    def test_set_preset_rejects_bad_slot(self, wired):
         server, _, pedal = wired
-        assert "error" in server.write_preset(200, "Bad", {})
+        assert "error" in server.set_preset(200, name="Bad")
         assert pedal.saves == []
 
     def test_name_is_truncated_to_sixteen_characters(self, wired):
         server, _, pedal = wired
         server.save_preset(0, "A" * 30)
         assert pedal.records[1].name == "A" * 16
-
-    def test_saving_invalidates_the_dump_cache(self, wired):
-        server, _, _ = wired
-        server.list_presets(0, 0)
-        assert server._record_cache
-        server.save_preset(0, "New")
-        assert server._record_cache == {}
 
 
 class TestExpressionAssignment:
@@ -329,45 +402,58 @@ class TestSystemSettings:
     def test_input_level_uses_the_observed_db_encoding(self, wired):
         """2.5 dB went out as raw 14."""
         server, _, pedal = wired
-        result = server.set_input_level(2.5)
-        assert result == {"db": 2.5, "raw": 14}
+        result = server.set_system_settings(input_level_db=2.5)
+        assert result == {"applied": {"input_level_db": 2.5}}
         assert pedal.settings[Command.INPUT_LEVEL] == [14]
 
     def test_otg_level_shares_that_encoding(self, wired):
         """1.0 dB went out as raw 11 -- the same 9-is-zero, 0.5 dB steps."""
         server, _, pedal = wired
-        assert server.set_otg_level(1.0) == {"db": 1.0, "raw": 11}
+        server.set_system_settings(otg_level_db=1.0)
         assert pedal.settings[Command.OTG_LEVEL] == [11]
 
     def test_zero_db_is_raw_nine(self, wired):
-        server, _, _ = wired
-        assert server.set_input_level(0)["raw"] == 9
+        server, _, pedal = wired
+        server.set_system_settings(input_level_db=0)
+        assert pedal.settings[Command.INPUT_LEVEL] == [9]
 
     def test_brightness_is_a_direct_value(self, wired):
         server, _, pedal = wired
-        assert server.set_screen_brightness(10) == {"brightness": 10}
+        server.set_system_settings(screen_brightness=10)
         assert pedal.settings[Command.SCREEN_BRIGHTNESS] == [10]
 
     def test_cab_sim_thru_carries_both_channels(self, wired):
         server, _, pedal = wired
-        server.set_cab_sim_thru(left=True, right=False)
+        server.set_system_settings(cab_sim_left=True, cab_sim_right=False)
         assert pedal.settings[Command.CAB_SIM_THRU] == [1, 0]
+
+    def test_cab_sim_needs_both_channels(self, wired):
+        server, _, pedal = wired
+        assert "error" in server.set_system_settings(cab_sim_left=True)
+        assert Command.CAB_SIM_THRU not in pedal.settings
 
     def test_spillover_toggles(self, wired):
         server, _, pedal = wired
-        server.set_spillover(True)
+        server.set_system_settings(spillover=True)
         assert pedal.settings[Command.SPILLOVER] == [1]
-        server.set_spillover(False)
+        server.set_system_settings(spillover=False)
         assert pedal.settings[Command.SPILLOVER] == [0]
 
-
-class TestEffectOrderIsFixed:
-    def test_reordering_is_refused_rather_than_dimming_the_screen(self, wired):
-        """It used to send its bytes under 0xA5, which is brightness."""
+    def test_sends_only_what_is_given(self, wired):
         server, _, pedal = wired
-        result = server.set_effect_order(["amp", "cab"])
+        result = server.set_system_settings(screen_brightness=12, spillover=True)
+        assert set(result["applied"]) == {"screen_brightness", "spillover"}
+        assert set(pedal.settings) == {Command.SCREEN_BRIGHTNESS, Command.SPILLOVER}
+
+    def test_nothing_is_sent_if_any_value_is_bad(self, wired):
+        server, _, pedal = wired
+        result = server.set_system_settings(spillover=True, screen_brightness=70000)
         assert "error" in result
-        assert Command.SCREEN_BRIGHTNESS not in pedal.settings
+        assert pedal.settings == {}
+
+    def test_no_arguments_is_an_error(self, wired):
+        server, _, _ = wired
+        assert "error" in server.set_system_settings()
 
 
 class TestCtrlConfig:
@@ -517,7 +603,7 @@ class TestUserModelUploads:
         server.upload_amp(0, "E-3RD POWER DRAG", (bytes([1]) * 10240).hex())
         server.upload_cab(1, "34 CT-BogOS412", (bytes([2]) * 1536).hex())
 
-        listing = server.list_ir_slots()
+        listing = server.list_user_models()
         amps = {a["display"]: a["name"] for a in listing["amps"] if not a["empty"]}
         cabs = {c["display"]: c["name"] for c in listing["cabs"] if not c["empty"]}
         assert amps == {56: "E-3RD POWER DRAG"}
@@ -546,9 +632,9 @@ class TestOptimizePresetPrompt:
 
     def test_prescribes_select_edit_save(self, wired):
         server, _, _ = wired
-        text = server.optimize_preset(3, "more clarity")
-        assert "select_preset slot=3" in text
-        assert "save_preset slot=3" in text
+        text = server.optimize_preset("1D", "more clarity")
+        assert "select_preset preset=1D" in text
+        assert "save_preset preset=1D" in text
         assert "then set_preset to save" not in text
 
     def test_the_prescribed_workflow_keeps_the_edit(self, wired):
@@ -580,12 +666,6 @@ class TestSelectSettles:
             left.append(frame.command)
         assert Command.CTRL_CONFIG not in left
 
-    def test_select_preset_slot_reports_the_confirmation(self, wired):
-        server, _, pedal = wired
-        assert server.select_preset_slot(4)["selected"] is True
-        pedal.silent_selects = {6}
-        assert server.select_preset_slot(5)["selected"] is False
-
     def test_unanswered_select_is_reported(self, wired):
         server, _, pedal = wired
         pedal.silent_selects = {5}
@@ -606,20 +686,10 @@ class TestSelectSettles:
         pedal.silent_selects = {6}
 
         result = server.set_preset(
-            5, name="Nope", effects={"amp": {"effect_type": 9}}
+            5, name="Nope", modules={"amp": {"effect_type": 9}}
         )
 
         assert result["stored"] is False
-        assert "error" in result
-        assert pedal.written_blocks == []
-        assert pedal.saves == []
-
-    def test_write_preset_writes_nothing_without_confirmation(self, wired):
-        server, _, pedal = wired
-        pedal.silent_selects = {6}
-
-        result = server.write_preset(5, "Nope", {"amp": {"effect_type": 9}})
-
         assert "error" in result
         assert pedal.written_blocks == []
         assert pedal.saves == []
@@ -676,7 +746,7 @@ class TestCtrlQuietTime:
         server.get_ctrl_config(3)
         naps = self._slept(server, lambda: server.select_preset(4))
         assert len(naps) == 1
-        assert 1.5 < naps[0] <= server.CTRL_SETTLE_SECONDS
+        assert 1.5 < naps[0] <= CTRL_SETTLE_SECONDS
 
     def test_no_wait_without_ctrl_traffic(self, wired):
         server, _, _ = wired
@@ -712,7 +782,7 @@ class TestRebootReconnect:
     def test_answering_pedal_needs_no_reset(self, wired):
         server, conn, _ = wired
         conn.reset_usb = lambda: pytest.fail("reset not needed")
-        assert server._reconnect(conn) is True
+        assert server.pedal.reconnect_after_reboot() is True
 
     def test_silent_pedal_is_recovered_by_a_usb_reset(self, wired):
         server, conn, pedal = wired
@@ -727,7 +797,7 @@ class TestRebootReconnect:
         conn.reset_usb = reset_usb
         conn.open = lambda: None
         with patch.object(server.time, "sleep"):
-            assert server._reconnect(conn) is True
+            assert server.pedal.reconnect_after_reboot() is True
         assert resets == [1]
 
     def test_reports_failure_when_the_pedal_stays_silent(self, wired):
@@ -759,28 +829,64 @@ class TestRebootReconnect:
         assert result["acknowledged"] is True
 
 
-class TestDumpCacheLifetime:
-    """The dump cache describes one connected pedal; it must not outlive
-    the connection."""
+class TestConnectionLifetime:
+    """The pedal opens on first use and reopens after a disconnect; a dump
+    read before describes a connection that is gone."""
 
-    def test_disconnect_drops_the_cache(self, wired):
-        server, conn, _ = wired
-        server._connection = conn
+    def test_disconnect_drops_the_last_dump(self, wired):
+        server, _, _ = wired
         server.list_presets(0, 9)
-        assert server._record_cache
+        assert server.pedal.last_dump
 
         server.disconnect()
 
-        assert server._record_cache == {}
+        assert not server.pedal.connected
+        assert server.pedal.last_dump == {}
 
-    def test_connect_starts_with_an_empty_cache(self, wired):
+    def test_tools_reconnect_on_their_own(self, wired):
+        server, _, _ = wired
+        server.disconnect()
+
+        assert server.get_preset("1A")["address"] == "1A"
+        assert server.pedal.connected
+
+    def test_connect_drops_a_dump_from_a_dropped_connection(self, wired):
         server, conn, _ = wired
         server.list_presets(0, 9)
-        assert server._record_cache
+        conn._connected = False  # the pedal went away without a disconnect
 
-        with patch.object(server, "USBConnection", return_value=conn), \
-                patch.object(conn, "open", return_value=conn.device_info):
-            server._connection = None
-            server.connect()
+        server.get_device_info()
 
-        assert server._record_cache == {}
+        assert server.pedal.connected
+        assert server.pedal.last_dump == {}
+
+
+class TestFilesAreNotSilentlyReplaced:
+    """backup_all over the last good backup is the loss a backup exists
+    to prevent; replacing a file takes overwrite=True."""
+
+    def test_backup_refuses_an_existing_file(self, wired, tmp_path):
+        server, conn, _ = wired
+        path = tmp_path / "keep.json"
+        path.write_text("last good backup")
+        conn.send_and_collect = lambda *a, **k: pytest.fail("pedal read first")
+
+        result = server.backup_all(str(path))
+
+        assert "error" in result and "overwrite" in result["error"]
+        assert path.read_text() == "last good backup"
+
+    def test_backup_replaces_it_when_asked(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "old.json"
+        path.write_text("old")
+        assert server.backup_all(str(path), overwrite=True)["preset_count"] == 200
+        assert path.read_text() != "old"
+
+    def test_export_refuses_an_existing_file(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "one.json"
+        path.write_text("keep")
+        assert "error" in server.export_preset("1A", str(path))
+        assert path.read_text() == "keep"
+        assert "error" not in server.export_preset("1A", str(path), overwrite=True)

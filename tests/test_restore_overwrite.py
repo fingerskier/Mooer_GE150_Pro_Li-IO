@@ -17,7 +17,7 @@ import pytest
 
 from mooer_ge150_mcp.protocol.commands import PRESET_NAME_LENGTH
 
-from .fake_max_pedal import make_max_connection
+from .fake_max_pedal import make_pedal
 
 
 def _get_server_module():
@@ -42,9 +42,9 @@ def _get_server_module():
 @pytest.fixture
 def wired():
     server = _get_server_module()
-    conn, pedal = make_max_connection()
-    server._record_cache = {}
-    with patch.object(server, "_get_connection", return_value=conn):
+    server.pedal, conn, pedal = make_pedal()
+    # The fake needs none of the pacing real hardware does.
+    with patch("time.sleep"):
         yield server, conn, pedal
 
 
@@ -109,7 +109,6 @@ def test_backup_fills_empty_device_slot(wired, tmp_path):
 
     # Empty the device slot after the backup.
     server.set_preset(0, name="")
-    server._record_cache = {}
     assert not pedal.records[1].name.strip()
 
     result = server.restore_backup(str(path), overwrite=False)
