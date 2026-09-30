@@ -102,9 +102,10 @@ SWAP = ToolAnnotations(
     readOnlyHint=False, destructiveHint=True, idempotentHint=False,
     openWorldHint=False,
 )
-#: Reads the pedal and writes a local file.
+#: Reads the pedal and writes a local file, which it can overwrite (only
+#: when asked to, but the hint describes the tool, not one call).
 TO_FILE = ToolAnnotations(
-    readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+    readOnlyHint=False, destructiveHint=True, idempotentHint=True,
     openWorldHint=False,
 )
 
@@ -243,6 +244,20 @@ def _record_from_file_entry(entry: dict[str, Any], slot: int) -> PresetRecord:
         )
     raw[0] = slot + FIRST_PRESET_SLOT
     return decode_preset_record(bytes(raw))
+
+
+def _refuse_overwrite(path: Path, overwrite: bool) -> dict[str, Any] | None:
+    """An error result if *path* exists and replacing it was not asked for.
+
+    A backup written over the last good backup is exactly the loss a
+    backup exists to prevent, so replacing a file takes an explicit yes.
+    """
+    if path.exists() and not overwrite:
+        return {
+            "error": f"{path} already exists; pass overwrite=true to "
+                     "replace it, or choose another path"
+        }
+    return None
 
 
 def _read_live_block(module: str) -> tuple[Command, ModuleBlock] | str:
@@ -786,14 +801,21 @@ def restore_backup(input_path: str, overwrite: bool = False) -> dict[str, Any]:
 # ─── FILES ────────────────────────────────────────────────────────────
 
 @mcp.tool(title="Back up all presets", annotations=TO_FILE)
-def backup_all(output_path: str) -> dict[str, Any]:
+def backup_all(output_path: str, overwrite: bool = False) -> dict[str, Any]:
     """Save every preset to a JSON backup file, each record byte for byte.
 
     System settings and CTRL configurations are not included yet.
 
     Args:
         output_path: File path for the backup.
+        overwrite: Replace the file if it already exists. Without it an
+            existing file is left alone and an error is returned.
     """
+    path = Path(output_path)
+    refused = _refuse_overwrite(path, overwrite)
+    if refused:
+        return refused
+
     records = pedal.read_presets()
     if not records:
         return {"error": "No response from device"}
@@ -803,7 +825,6 @@ def backup_all(output_path: str) -> dict[str, Any]:
         "version": 1,
         "presets": [_record_to_file_entry(records[s]) for s in sorted(records)],
     }
-    path = Path(output_path)
     path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
     result: dict[str, Any] = {"path": str(path), "preset_count": len(records)}
@@ -818,23 +839,30 @@ def backup_all(output_path: str) -> dict[str, Any]:
 
 
 @mcp.tool(title="Export preset", annotations=TO_FILE)
-def export_preset(preset: int | str, output_path: str) -> dict[str, Any]:
+def export_preset(
+    preset: int | str, output_path: str, overwrite: bool = False
+) -> dict[str, Any]:
     """Save one preset to a JSON file, byte for byte.
 
     Args:
         preset: The preset, e.g. "5A" or 16.
         output_path: Output file path.
+        overwrite: Replace the file if it already exists. Without it an
+            existing file is left alone and an error is returned.
     """
     try:
         slot = parse_preset(preset)
     except ValueError as exc:
         return {"error": str(exc)}
+    path = Path(output_path)
+    refused = _refuse_overwrite(path, overwrite)
+    if refused:
+        return refused
 
     record = pedal.read_presets().get(slot)
     if record is None:
         return {"error": f"Device did not return a record for {preset}"}
     entry = {**_record_to_file_entry(record), "format": PRESET_FORMAT, "version": 1}
-    path = Path(output_path)
     path.write_text(json.dumps(entry, indent=1), encoding="utf-8")
     return {"path": str(path), "name": record.name}
 

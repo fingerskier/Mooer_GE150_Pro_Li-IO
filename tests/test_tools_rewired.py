@@ -65,7 +65,8 @@ def test_every_tool_says_whether_it_changes_the_pedal():
             assert tool.annotations.readOnlyHint is False, name
 
     for name in ("put_preset", "restore_backup", "set_preset",
-                 "swap_presets", "copy_preset", "save_preset"):
+                 "swap_presets", "copy_preset", "save_preset",
+                 "backup_all", "export_preset"):
         assert tools[name].annotations.destructiveHint is True, name
     for name in ("select_preset", "set_effect_param", "toggle_effect"):
         assert tools[name].annotations.destructiveHint is False, name
@@ -858,3 +859,34 @@ class TestConnectionLifetime:
 
         assert server.pedal.connected
         assert server.pedal.last_dump == {}
+
+
+class TestFilesAreNotSilentlyReplaced:
+    """backup_all over the last good backup is the loss a backup exists
+    to prevent; replacing a file takes overwrite=True."""
+
+    def test_backup_refuses_an_existing_file(self, wired, tmp_path):
+        server, conn, _ = wired
+        path = tmp_path / "keep.json"
+        path.write_text("last good backup")
+        conn.send_and_collect = lambda *a, **k: pytest.fail("pedal read first")
+
+        result = server.backup_all(str(path))
+
+        assert "error" in result and "overwrite" in result["error"]
+        assert path.read_text() == "last good backup"
+
+    def test_backup_replaces_it_when_asked(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "old.json"
+        path.write_text("old")
+        assert server.backup_all(str(path), overwrite=True)["preset_count"] == 200
+        assert path.read_text() != "old"
+
+    def test_export_refuses_an_existing_file(self, wired, tmp_path):
+        server, _, _ = wired
+        path = tmp_path / "one.json"
+        path.write_text("keep")
+        assert "error" in server.export_preset("1A", str(path))
+        assert path.read_text() == "keep"
+        assert "error" not in server.export_preset("1A", str(path), overwrite=True)
