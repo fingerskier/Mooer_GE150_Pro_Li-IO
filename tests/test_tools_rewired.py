@@ -389,13 +389,14 @@ class TestCtrlConfig:
         assert toggles["reverb"] is True
         assert toggles["amp"] is False
 
-    def test_ignores_the_0x29_a_preset_select_pushes(self, wired):
-        """Selecting a preset makes the pedal push a 0x29 for that slot.
-        Left queued, it used to be taken as the reply for another slot."""
+    def test_ignores_a_pushed_0x29_for_another_slot(self, wired):
+        """A preset load makes the pedal push a 0x29 for that slot. One
+        queued ahead of the reply used to be taken as the answer."""
         server, _, pedal = wired
         pedal.ctrl_flags[5] = [c in (Command.DELAY, Command.REVERB)
                                for c in MODULE_CHAIN]
-        server.select_preset(0)
+        pedal._respond(0x2A, bytes(9))
+        pedal._respond(Command.CTRL_CONFIG, bytes([0]) + bytes(9))
 
         result = server.get_ctrl_config(5)
 
@@ -550,3 +551,143 @@ class TestOptimizePresetPrompt:
         saved = pedal.records[4]
         assert saved.modules[Command.AMP].params[0] == 99
         assert saved.name == name
+
+
+class TestSelectSettles:
+    """Nothing may follow a select until the pedal reports the preset
+    loaded: a command landing mid-load hung real hardware (2026-09-30)."""
+
+    def test_select_consumes_the_load_complete_push(self, wired):
+        server, conn, pedal = wired
+        pedal.ctrl_flags[4] = [c == Command.DS for c in MODULE_CHAIN]
+
+        result = server.select_preset(4)
+
+        assert result["confirmed"] is True
+        left = []
+        while (frame := conn.read_message()) is not None:
+            left.append(frame.command)
+        assert Command.CTRL_CONFIG not in left
+
+    def test_select_preset_slot_reports_the_confirmation(self, wired):
+        server, _, pedal = wired
+        assert server.select_preset_slot(4)["selected"] is True
+        pedal.silent_selects = {6}
+        assert server.select_preset_slot(5)["selected"] is False
+
+    def test_unanswered_select_is_reported(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {5}
+        result = server.select_preset(4)
+        assert result["confirmed"] is False
+        assert "warning" in result
+
+    def test_a_stale_0x29_for_the_same_slot_does_not_count(self, wired):
+        """Left over from earlier, it would end the wait before the load
+        had even begun."""
+        server, _, pedal = wired
+        pedal._respond(Command.CTRL_CONFIG, bytes([4]) + bytes(9))
+        pedal.silent_selects = {5}
+        assert server.select_preset(4)["confirmed"] is False
+
+    def test_set_preset_writes_nothing_without_confirmation(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {6}
+
+        result = server.set_preset(
+            5, name="Nope", effects={"amp": {"effect_type": 9}}
+        )
+
+        assert result["stored"] is False
+        assert "error" in result
+        assert pedal.written_blocks == []
+        assert pedal.saves == []
+
+    def test_write_preset_writes_nothing_without_confirmation(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {6}
+
+        result = server.write_preset(5, "Nope", {"amp": {"effect_type": 9}})
+
+        assert "error" in result
+        assert pedal.written_blocks == []
+        assert pedal.saves == []
+
+    def test_copy_saves_nothing_without_confirmation(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {1}
+        result = server.copy_preset(0, 9)
+        assert result["copied"] is False
+        assert pedal.saves == []
+
+    def test_half_done_swap_hands_back_the_displaced_preset(self, wired):
+        server, _, pedal = wired
+        name_a, name_b = pedal.records[1].name, pedal.records[8].name
+        pedal.records[1].tail = bytes(range(12))
+        pedal.silent_selects = {8}  # the second write's select
+
+        result = server.swap_presets(0, 7)
+
+        assert result["swapped"] is False
+        assert pedal.records[1].name == name_b  # first half landed
+        assert pedal.records[8].name == name_b  # second half did not
+        assert result["displaced"]["name"] == name_a
+        assert result["displaced"]["tail"] == bytes(range(12)).hex()
+
+    def test_swap_writes_nothing_if_the_first_select_fails(self, wired):
+        server, _, pedal = wired
+        pedal.silent_selects = {1}
+        result = server.swap_presets(0, 7)
+        assert result["swapped"] is False
+        assert "displaced" not in result
+        assert pedal.saves == []
+
+    def test_drain_discards_queued_input(self, wired):
+        _, conn, pedal = wired
+        pedal._respond(0x2A, bytes(9))
+        pedal._respond(Command.CTRL_CONFIG, bytes(10))
+        assert conn.drain() == 2
+        assert conn.read_message() is None
+
+
+class TestCtrlQuietTime:
+    """After a CTRL read the pedal is busy for about a second, and a
+    select landing in that window hung real hardware (2026-09-30)."""
+
+    def _slept(self, server, call):
+        naps = []
+        with patch.object(server.time, "sleep", naps.append):
+            call()
+        return naps
+
+    def test_select_waits_out_a_recent_ctrl_read(self, wired):
+        server, _, _ = wired
+        server.get_ctrl_config(3)
+        naps = self._slept(server, lambda: server.select_preset(4))
+        assert len(naps) == 1
+        assert 1.5 < naps[0] <= server.CTRL_SETTLE_SECONDS
+
+    def test_no_wait_without_ctrl_traffic(self, wired):
+        server, _, _ = wired
+        assert self._slept(server, lambda: server.select_preset(4)) == []
+
+    def test_consecutive_ctrl_reads_are_not_delayed(self, wired):
+        server, _, _ = wired
+        server.get_ctrl_config(3)
+        assert self._slept(server, lambda: server.get_ctrl_config(4)) == []
+
+    def test_ctrl_write_starts_the_quiet_time_too(self, wired):
+        server, _, _ = wired
+        server.set_ctrl_config(3, ["delay"])
+        naps = self._slept(server, lambda: server.select_preset(4))
+        assert naps and naps[0] > 1.5
+
+    def test_save_and_restore_bracket_wait_too(self, wired):
+        server, _, _ = wired
+        server.get_ctrl_config(3)
+        assert self._slept(server, lambda: server.save_preset(4, "X"))[0] > 1.5
+        server.get_ctrl_config(3)
+        naps = self._slept(
+            server, lambda: server.copy_preset(0, 9, byte_exact=True)
+        )
+        assert naps[0] > 1.5

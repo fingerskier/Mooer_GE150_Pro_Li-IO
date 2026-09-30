@@ -15,6 +15,8 @@ Request              Response
 ``0xC1`` IR LIST     ``0x41``, 40 x 16-byte names
 ``0xB0`` ACTIVE      ``0x30``, active preset state
 ``0x82``-``0x8A``    echoes the block back as ``0x02``-``0x0A``
+``0x96`` SELECT      ``0x2A`` (9 CTRL flags), then ``0x29`` (0-based
+                     slot + the same flags) once the preset has loaded
 ``0x97`` SAVE        ``0x17`` notification
 ===================  ==========================================
 """
@@ -81,6 +83,8 @@ class FakeMaxPedal:
         self.active_slot = 1
         self.written_blocks: list[tuple[int, ModuleBlock]] = []
         self.selected: list[int] = []
+        #: Wire slots whose select goes unanswered, as from a hung pedal.
+        self.silent_selects: set[int] = set()
         self.saves: list[tuple[int, bytes]] = []
         self.uploaded: list[int] = []
         self.restore_brackets: list[str] = []
@@ -176,11 +180,18 @@ class FakeMaxPedal:
 
         elif command == Command.SELECT_PRESET:
             slot = payload[0]
+            if slot in self.silent_selects:
+                return
+            flags = bytes(9)
             if 1 <= slot <= NUM_SLOTS:
                 self.active_slot = slot
                 self.selected.append(slot)
-            self._respond(0x2A, bytes(9))
-            self._respond(0x29, bytes([slot - 1]) + bytes(9))
+                flags = bytes(1 if f else 0 for f in self.ctrl_flags[slot - 1])
+            # Hardware (2026-09-30): both pushes carry the selected
+            # preset's CTRL flags and arrive ~0.2 s after the select,
+            # re-selecting the active preset included.
+            self._respond(0x2A, flags)
+            self._respond(0x29, bytes([slot - 1]) + flags)
             self._respond(Command.PRESET_CHANGED, b"")
 
         elif command == Command.SAVE_PRESET:

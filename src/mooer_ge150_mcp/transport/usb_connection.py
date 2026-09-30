@@ -285,6 +285,22 @@ class USBConnection:
             logger.debug("Read error: %s", e)
             return None
 
+    def drain(self, max_reports: int = 256) -> int:
+        """Discard reports already queued from the pedal.
+
+        The pedal pushes state unprompted, so stale input can sit ahead
+        of the next reply. Call this before an exchange that must not be
+        satisfied by something the pedal said earlier.
+
+        Returns:
+            The number of reports discarded.
+        """
+        count = 0
+        # 1 ms, not 0: hidapi treats a zero timeout as a blocking read.
+        while count < max_reports and self.read(timeout_ms=1) is not None:
+            count += 1
+        return count
+
     def read_message(self, timeout_ms: int = READ_TIMEOUT_MS) -> Frame | None:
         """Read one complete protocol message, reassembling chunked reports.
 
