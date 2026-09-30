@@ -1,0 +1,11 @@
+# MOOER GE150 Max / GE150 Max Li (34db:000f): let the logged-in user talk
+# to the pedal without root.
+#
+#   sudo cp udev/70-mooer-ge150.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# The usb rule covers hidapi's libusb backend and the USB port reset the
+# server falls back to; the hidraw rule covers the hidraw backend. The
+# file number must stay below 73 for the uaccess tag to take effect.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="34db", ATTRS{idProduct}=="000f", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="34db", ATTRS{idProduct}=="000f", TAG+="uaccess"

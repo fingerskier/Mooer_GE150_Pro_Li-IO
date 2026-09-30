@@ -65,7 +65,8 @@ Run on a real pedal before releases and after any change to
 * GE150 Pro Li connected via USB-C, powered on, **fully charged or on
   mains** (a power loss mid-write can corrupt a slot).
 * Mooer Studio software **closed** (it holds the HID interface).
-* Linux: udev permission for VID:PID `0483:5703`, or run with sudo.
+* Linux: the udev rule in `udev/70-mooer-ge150.rules` installed (VID:PID
+  `34db:000f`), or run with sudo.
 * An MCP client wired to this server, or a Python REPL importing
   `mooer_ge150_mcp.server` directly.
 
