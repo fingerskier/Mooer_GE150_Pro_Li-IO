@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from ..protocol.framing import (
@@ -346,6 +347,7 @@ class USBConnection:
         command: int,
         timeout_ms: int = READ_TIMEOUT_MS,
         max_skip: int = 32,
+        match: Callable[[Frame], bool] | None = None,
     ) -> Frame | None:
         """Send a command and return the first reply with *command*.
 
@@ -359,6 +361,10 @@ class USBConnection:
             command: The reply command ID to wait for.
             timeout_ms: Timeout for each individual report read.
             max_skip: Give up after this many unrelated messages.
+            match: Optional extra check on a *command* reply. Needed where
+                the pedal pushes the same command unprompted: a preset
+                select pushes a 0x29 that is indistinguishable from a
+                CTRL-config reply except by its slot byte.
 
         Returns:
             The matching Frame, or None on timeout or if too many
@@ -370,7 +376,7 @@ class USBConnection:
             frame = self.read_message(timeout_ms)
             if frame is None:
                 return None
-            if frame.command == command:
+            if frame.command == command and (match is None or match(frame)):
                 return frame
             logger.debug(
                 "Skipping unsolicited 0x%02X while awaiting 0x%02X",

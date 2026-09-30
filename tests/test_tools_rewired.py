@@ -389,6 +389,21 @@ class TestCtrlConfig:
         assert toggles["reverb"] is True
         assert toggles["amp"] is False
 
+    def test_ignores_the_0x29_a_preset_select_pushes(self, wired):
+        """Selecting a preset makes the pedal push a 0x29 for that slot.
+        Left queued, it used to be taken as the reply for another slot."""
+        server, _, pedal = wired
+        pedal.ctrl_flags[5] = [c in (Command.DELAY, Command.REVERB)
+                               for c in MODULE_CHAIN]
+        server.select_preset(0)
+
+        result = server.get_ctrl_config(5)
+
+        assert result["slot"] == 5
+        assert {m for m, on in result["toggles"].items() if on} == {
+            "delay", "reverb"
+        }
+
     def test_ctrl_slots_are_zero_based_on_the_wire(self, wired):
         server, _, pedal = wired
         server.set_ctrl_config(0, ["amp"])
@@ -425,6 +440,29 @@ class TestPutPreset:
         original = server.get_preset(10)
         server.put_preset(11, original)
         assert server.get_preset(11)["name"] == original["name"]
+
+    def test_round_trip_carries_the_tail(self, wired):
+        """put_preset(get_preset(x)) used to zero the 12-byte tail."""
+        server, _, pedal = wired
+        pedal.records[11].tail = bytes(range(1, 13))  # server slot 10
+
+        server.put_preset(10, server.get_preset(10))  # in place
+        server.put_preset(11, server.get_preset(10))  # to another slot
+
+        assert pedal.records[11].tail == bytes(range(1, 13))
+        assert pedal.records[12].tail == bytes(range(1, 13))
+
+    def test_without_a_tail_the_slot_keeps_its_own(self, wired):
+        server, _, pedal = wired
+        pedal.records[5].tail = b"\xAB" * 12
+        server.put_preset(4, {"name": "No Tail", "modules": {}})
+        assert pedal.records[5].tail == b"\xAB" * 12
+
+    def test_rejects_a_malformed_tail(self, wired):
+        server, _, pedal = wired
+        assert "error" in server.put_preset(4, {"name": "x", "tail": "zz"})
+        assert "error" in server.put_preset(4, {"name": "x", "tail": "00"})
+        assert pedal.uploaded == []
 
     def test_rejects_bad_slot_and_module(self, wired):
         server, _, pedal = wired
@@ -488,3 +526,27 @@ class TestUserModelUploads:
         server, _, _ = wired
         assert "error" in server.upload_cab(20, "X", "00" * 1536)
         assert "error" in server.upload_amp(20, "X", "00" * 10240)
+
+
+class TestOptimizePresetPrompt:
+    """The prompt used to say "set_effect_param, then set_preset to save",
+    which rewrote the slot from its stored copy and lost the edits."""
+
+    def test_prescribes_select_edit_save(self, wired):
+        server, _, _ = wired
+        text = server.optimize_preset(3, "more clarity")
+        assert "select_preset slot=3" in text
+        assert "save_preset slot=3" in text
+        assert "then set_preset to save" not in text
+
+    def test_the_prescribed_workflow_keeps_the_edit(self, wired):
+        server, _, pedal = wired
+        name = server.get_preset(3)["name"]
+
+        server.select_preset(3)
+        server.set_effect_param("amp", 0, 99)
+        server.save_preset(3, name)
+
+        saved = pedal.records[4]
+        assert saved.modules[Command.AMP].params[0] == 99
+        assert saved.name == name
