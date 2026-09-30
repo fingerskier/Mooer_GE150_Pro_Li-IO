@@ -79,6 +79,21 @@ Every tool is annotated as read-only or not, and as destructive or not,
 so an MCP client can auto-allow reads and ask before writes. Backups
 are JSON files holding each preset byte for byte.
 
+## Skills (Claude Code)
+
+The plugin also ships skills, which Claude Code loads only when they are
+needed:
+
+| Skill | What it does |
+|---|---|
+| `/mooer-ge150:guide` | The operating guide: addresses, live vs stored, what reboots the pedal, backups, and what is known about each module's parameters. Claude loads it on its own when you talk about the pedal. |
+| `/mooer-ge150:tone [preset] [goal]` | Build or refine a sound by ear: live edits you listen to, then a save. |
+| `/mooer-ge150:organize [goal]` | Group, move and rename presets across banks, from a plan you approve. |
+| `/mooer-ge150:hil-test <bank>` | The hardware test in `TESTING.md`, run on one scratch bank that is restored afterwards. It only runs when you invoke it. |
+
+Skills that change presets back up first, to
+`~/.claude/plugins/data/<plugin>/backups/`.
+
 ## Publishing
 
 ### To npm (enables `npx mooer-ge150-mcp`)

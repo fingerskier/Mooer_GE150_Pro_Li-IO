@@ -39,6 +39,11 @@ preset ships with a test that reads the change back.
 
 ## 2. Hardware-in-the-loop procedure
 
+With the plugin loaded in Claude Code, `/mooer-ge150:hil-test <bank>` runs
+this whole procedure on a scratch bank. It compares the backups with
+`skills/hil-test/backups.py` and reports PASS/FAIL per step. The steps
+below are the same procedure, for running by hand.
+
 ### Prerequisites
 
 * The pedal on USB and powered, with MOOER Studio closed.

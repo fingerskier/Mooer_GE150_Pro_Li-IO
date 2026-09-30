@@ -76,6 +76,8 @@ opens on first use; disconnect releases it (e.g. for MOOER Studio).
 - Run backup_all before bulk or destructive changes.
 - Effect types and parameters are raw numbers; most of their names are not
   known yet, and the effect chain order is fixed.
+- In Claude Code, the plugin's skills carry the details: guide, tone,
+  organize and hil-test.
 """
 
 mcp = FastMCP("mooer-ge150", instructions=INSTRUCTIONS)
@@ -807,7 +809,8 @@ def backup_all(output_path: str, overwrite: bool = False) -> dict[str, Any]:
     System settings and CTRL configurations are not included yet.
 
     Args:
-        output_path: File path for the backup.
+        output_path: File path for the backup. Missing folders are
+            created.
         overwrite: Replace the file if it already exists. Without it an
             existing file is left alone and an error is returned.
     """
@@ -825,6 +828,7 @@ def backup_all(output_path: str, overwrite: bool = False) -> dict[str, Any]:
         "version": 1,
         "presets": [_record_to_file_entry(records[s]) for s in sorted(records)],
     }
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=1), encoding="utf-8")
 
     result: dict[str, Any] = {"path": str(path), "preset_count": len(records)}
@@ -846,7 +850,7 @@ def export_preset(
 
     Args:
         preset: The preset, e.g. "5A" or 16.
-        output_path: Output file path.
+        output_path: Output file path. Missing folders are created.
         overwrite: Replace the file if it already exists. Without it an
             existing file is left alone and an error is returned.
     """
@@ -863,6 +867,7 @@ def export_preset(
     if record is None:
         return {"error": f"Device did not return a record for {preset}"}
     entry = {**_record_to_file_entry(record), "format": PRESET_FORMAT, "version": 1}
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(entry, indent=1), encoding="utf-8")
     return {"path": str(path), "name": record.name}
 
@@ -1118,71 +1123,6 @@ def resource_effects_catalog() -> str:
         for category, effects in EFFECT_CATALOG.items()
     }
     return json.dumps({"effects": catalog, "verified": False})
-
-
-# ─── MCP PROMPTS ─────────────────────────────────────────────────────
-
-@mcp.prompt()
-def create_tone(style: str) -> str:
-    """Guide the AI to build a preset for a specific musical style or reference tone.
-
-    Args:
-        style: Genre, artist, or song name.
-    """
-    return f"""Create a preset for {style} style.
-Consider:
-- Amp model selection for the right gain structure
-- Appropriate drive/overdrive settings
-- EQ shaping for the style
-- Modulation, delay, and reverb to taste
-- Noise gate threshold based on gain level
-
-Effect-type numbers are raw: read a few existing presets with get_preset
-to see which numbers they use. The catalog resources are unverified.
-
-Back up first with backup_all, then use set_preset to store the result."""
-
-
-@mcp.prompt()
-def optimize_preset(preset: str, goal: str) -> str:
-    """Analyze an existing preset and suggest improvements.
-
-    Args:
-        preset: The preset to analyze, e.g. "5A".
-        goal: Optimization goal (e.g., "less noise", "more clarity").
-    """
-    return f"""Read preset {preset} using the get_preset tool and analyze its settings.
-Suggest improvements for: {goal}
-
-Consider:
-- Current amp settings and whether they suit the goal
-- Noise gate threshold relative to gain level
-- EQ balance and frequency shaping
-- Effect levels and interactions
-(The effect chain order is fixed on this pedal, so don't suggest reordering.)
-
-To apply changes:
-1. select_preset preset={preset} -- set_effect_param and toggle_effect edit
-   the ACTIVE preset only, so make this one active first.
-2. Adjust with set_effect_param / toggle_effect and let the user listen.
-3. Commit with save_preset preset={preset}.
-Do not save with set_preset: it rewrites the preset from its stored copy
-and discards the live edits."""
-
-
-@mcp.prompt()
-def batch_organize() -> str:
-    """Help organize and rename presets across the 200 slots."""
-    return """Read all presets using list_presets. Group them by style/genre.
-Suggest a logical ordering and naming convention.
-Consider:
-- Clean tones in banks 1-12
-- Crunch/overdrive in banks 13-25
-- High gain in banks 26-37
-- Effects-heavy / ambient in banks 38-50
-
-Back up first with backup_all. Use copy_preset and swap_presets to
-reorganize, and set_preset to rename presets."""
 
 
 # ─── ENTRY POINT ─────────────────────────────────────────────────────
